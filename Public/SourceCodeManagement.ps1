@@ -410,3 +410,263 @@ WHERE ItemId = @ItemId AND ItemType = @ItemType;
         Write-IntuneInventoryLog -Message "Inventory item retrieval completed" -Level Info -Source "Get-IntuneInventoryItem"
     }
 }
+
+function Get-IntuneLobAppContent {
+    <#
+    .SYNOPSIS
+    Downloads the actual .intunewin files for Win32 LOB applications from Intune.
+    
+    .DESCRIPTION
+    Uses Microsoft Graph API to download the encrypted content files for Win32 LOB applications.
+    Downloads the original .intunewin files that contain the application installers.
+    
+    .PARAMETER AppId
+    The ID of the specific application to download. If not specified, downloads all Win32 LOB apps.
+    
+    .PARAMETER DownloadPath
+    The path where downloaded content should be stored. Defaults to storage\downloaded-apps.
+    
+    .PARAMETER Force
+    Overwrite existing downloaded files.
+    
+    .EXAMPLE
+    Get-IntuneLobAppContent
+    
+    .EXAMPLE
+    Get-IntuneLobAppContent -AppId "12345678-1234-1234-1234-123456789012" -DownloadPath "C:\AppBackups"
+    
+    .EXAMPLE
+    Get-IntuneLobAppContent -Force
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string]$AppId,
+        
+        [Parameter()]
+        [string]$DownloadPath,
+        
+        [Parameter()]
+        [switch]$Force
+    )
+    
+    begin {
+        Write-IntuneInventoryLog -Message "Starting LOB app content download" -Level Info -Source "Get-IntuneLobAppContent"
+        
+        if (-not (Test-IntuneConnection)) {
+            throw "Microsoft Graph authentication is not valid. Please run Connect-IntuneInventory first."
+        }
+        
+        if (-not (Test-StorageConnection)) {
+            throw "JSON storage connection is not available. Please run Connect-IntuneInventory first."
+        }
+        
+        # Set default download path
+        if (-not $DownloadPath) {
+            $DownloadPath = Join-Path $Script:StorageRoot "downloaded-apps"
+        }
+        
+        # Ensure download directory exists
+        if (-not (Test-Path $DownloadPath)) {
+            New-Item -Path $DownloadPath -ItemType Directory -Force | Out-Null
+            Write-IntuneInventoryLog -Message "Created download directory: $DownloadPath" -Level Info
+        }
+    }
+    
+    process {
+        $StartTime = Get-Date
+        $ItemsProcessed = 0
+        $ErrorCount = 0
+        $ErrorMessages = @()
+        $DownloadedFiles = @()
+        
+        try {
+            # Get applications from storage
+            $AllApps = Get-InventoryItems -ItemType "Applications"
+            
+            # Filter to Win32 LOB apps
+            if ($AppId) {
+                $LobApps = $AllApps | Where-Object { $_.Id -eq $AppId -and $_.AppType -eq '#microsoft.graph.win32LobApp' }
+                if (-not $LobApps) {
+                    throw "App with ID '$AppId' not found or is not a Win32 LOB app"
+                }
+            } else {
+                $LobApps = $AllApps | Where-Object { $_.AppType -eq '#microsoft.graph.win32LobApp' }
+            }
+            
+            if (-not $LobApps -or $LobApps.Count -eq 0) {
+                Write-IntuneInventoryLog -Message "No Win32 LOB apps found to download" -Level Warning
+                return @{
+                    Success = $true
+                    ItemsProcessed = 0
+                    Message = "No Win32 LOB apps found"
+                }
+            }
+            
+            Write-IntuneInventoryLog -Message "Found $($LobApps.Count) Win32 LOB apps to process" -Level Info
+            
+            foreach ($App in $LobApps) {
+                try {
+                    Write-IntuneInventoryLog -Message "Processing app: $($App.DisplayName) (ID: $($App.Id))" -Level Verbose
+                    
+                    # Create app-specific directory
+                    $AppDir = Join-Path $DownloadPath $App.Id
+                    if (-not (Test-Path $AppDir)) {
+                        New-Item -Path $AppDir -ItemType Directory -Force | Out-Null
+                    }
+                    
+                    # Check if already downloaded
+                    $ExistingFiles = Get-ChildItem $AppDir -Filter "*.intunewin" -ErrorAction SilentlyContinue
+                    if ($ExistingFiles -and -not $Force) {
+                        Write-IntuneInventoryLog -Message "App content already downloaded for '$($App.DisplayName)'. Use -Force to re-download." -Level Info
+                        continue
+                    }
+                    
+                    # Get content versions from Graph API
+                    Write-IntuneInventoryLog -Message "Retrieving content versions for '$($App.DisplayName)'" -Level Verbose
+                    $ContentVersionsUri = "beta/deviceAppManagement/mobileApps/$($App.Id)/contentVersions"
+                    $ContentVersions = Get-GraphRequestAll -Uri $ContentVersionsUri
+                    
+                    if (-not $ContentVersions -or $ContentVersions.Count -eq 0) {
+                        Write-IntuneInventoryLog -Message "No content versions found for '$($App.DisplayName)'" -Level Warning
+                        $ErrorCount++
+                        $ErrorMessages += "No content versions for $($App.DisplayName)"
+                        continue
+                    }
+                    
+                    # Get latest version
+                    $LatestVersion = $ContentVersions | Sort-Object { [datetime]$_.createdDateTime } -Descending | Select-Object -First 1
+                    Write-IntuneInventoryLog -Message "Using content version $($LatestVersion.id) for '$($App.DisplayName)'" -Level Verbose
+                    
+                    # Get content files
+                    $ContentFilesUri = "beta/deviceAppManagement/mobileApps/$($App.Id)/contentVersions/$($LatestVersion.id)/files"
+                    $ContentFiles = Get-GraphRequestAll -Uri $ContentFilesUri
+                    
+                    if (-not $ContentFiles -or $ContentFiles.Count -eq 0) {
+                        Write-IntuneInventoryLog -Message "No content files found for '$($App.DisplayName)'" -Level Warning
+                        $ErrorCount++
+                        $ErrorMessages += "No content files for $($App.DisplayName)"
+                        continue
+                    }
+                    
+                    # Download each content file
+                    foreach ($ContentFile in $ContentFiles) {
+                        try {
+                            Write-IntuneInventoryLog -Message "Downloading file: $($ContentFile.name) for '$($App.DisplayName)'" -Level Verbose
+                            
+                            # Get download URL
+                            $DownloadUrlUri = "beta/deviceAppManagement/mobileApps/$($App.Id)/contentVersions/$($LatestVersion.id)/files/$($ContentFile.id)"
+                            $FileDetails = Invoke-GraphRequest -Uri $DownloadUrlUri -Method GET
+                            
+                            if (-not $FileDetails.azureStorageUri) {
+                                Write-IntuneInventoryLog -Message "No download URL available for file: $($ContentFile.name)" -Level Warning
+                                continue
+                            }
+                            
+                            # Download the file
+                            $LocalFilePath = Join-Path $AppDir $ContentFile.name
+                            $DownloadUri = $FileDetails.azureStorageUri
+                            
+                            Write-IntuneInventoryLog -Message "Downloading to: $LocalFilePath" -Level Verbose
+                            Invoke-WebRequest -Uri $DownloadUri -OutFile $LocalFilePath -ErrorAction Stop
+                            
+                            # Verify file size if available
+                            if ($ContentFile.size -and (Test-Path $LocalFilePath)) {
+                                $ActualSize = (Get-Item $LocalFilePath).Length
+                                if ($ActualSize -eq $ContentFile.size) {
+                                    Write-IntuneInventoryLog -Message "Successfully downloaded: $($ContentFile.name) ($ActualSize bytes)" -Level Info
+                                    $DownloadedFiles += @{
+                                        AppName = $App.DisplayName
+                                        AppId = $App.Id
+                                        FileName = $ContentFile.name
+                                        FilePath = $LocalFilePath
+                                        FileSize = $ActualSize
+                                    }
+                                } else {
+                                    Write-IntuneInventoryLog -Message "File size mismatch for $($ContentFile.name). Expected: $($ContentFile.size), Actual: $ActualSize" -Level Warning
+                                }
+                            }
+                        }
+                        catch {
+                            Write-IntuneInventoryLog -Message "Failed to download file '$($ContentFile.name)' for '$($App.DisplayName)': $($_.Exception.Message)" -Level Error
+                            $ErrorCount++
+                            $ErrorMessages += "Download failed for $($ContentFile.name) in $($App.DisplayName)"
+                        }
+                    }
+                    
+                    # Save app metadata
+                    $AppMetadata = @{
+                        AppInfo = $App
+                        ContentVersion = $LatestVersion
+                        ContentFiles = $ContentFiles
+                        DownloadTimestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                    }
+                    
+                    $MetadataPath = Join-Path $AppDir "app-metadata.json"
+                    $AppMetadata | ConvertTo-Json -Depth 10 | Set-Content $MetadataPath
+                    
+                    $ItemsProcessed++
+                    
+                    if ($ItemsProcessed % 10 -eq 0) {
+                        Write-IntuneInventoryLog -Message "Processed $ItemsProcessed apps so far..." -Level Info
+                    }
+                }
+                catch {
+                    $ErrorCount++
+                    $ErrorMessage = "Failed to download content for app '$($App.DisplayName)': $($_.Exception.Message)"
+                    $ErrorMessages += $ErrorMessage
+                    Write-IntuneInventoryLog -Message $ErrorMessage -Level Error
+                }
+            }
+            
+            # Generate summary
+            $EndTime = Get-Date
+            $Duration = ($EndTime - $StartTime).TotalMinutes
+            
+            $SuccessMessage = "LOB app content download completed. Processed $ItemsProcessed apps, downloaded $($DownloadedFiles.Count) files"
+            if ($ErrorCount -gt 0) {
+                $SuccessMessage += " with $ErrorCount errors"
+            }
+            
+            Write-IntuneInventoryLog -Message $SuccessMessage -Level Info
+            Write-Host "`n=== DOWNLOAD SUMMARY ===" -ForegroundColor Green
+            Write-Host "📱 Apps Processed: $ItemsProcessed" -ForegroundColor Cyan
+            Write-Host "📁 Files Downloaded: $($DownloadedFiles.Count)" -ForegroundColor Cyan
+            Write-Host "💾 Download Location: $DownloadPath" -ForegroundColor Cyan
+            Write-Host "⏱️  Duration: $([math]::Round($Duration, 2)) minutes" -ForegroundColor Cyan
+            
+            if ($DownloadedFiles.Count -gt 0) {
+                Write-Host "`n=== DOWNLOADED FILES ===" -ForegroundColor Yellow
+                $DownloadedFiles | ForEach-Object {
+                    Write-Host "  $($_.AppName): $($_.FileName) ($([math]::Round($_.FileSize / 1MB, 2)) MB)" -ForegroundColor White
+                }
+            }
+            
+            if ($ErrorCount -gt 0) {
+                Write-Host "`n⚠️  ERRORS: $ErrorCount" -ForegroundColor Red
+                $ErrorMessages | ForEach-Object { Write-Host "   - $_" -ForegroundColor Red }
+            }
+            
+            return @{
+                Success = $true
+                ItemsProcessed = $ItemsProcessed
+                FilesDownloaded = $DownloadedFiles.Count
+                DownloadedFiles = $DownloadedFiles
+                ErrorCount = $ErrorCount
+                ErrorMessages = $ErrorMessages
+                Duration = [math]::Round($Duration, 2)
+                DownloadPath = $DownloadPath
+                Message = $SuccessMessage
+            }
+        }
+        catch {
+            $ErrorMessage = "Critical error during LOB app content download: $($_.Exception.Message)"
+            Write-IntuneInventoryLog -Message $ErrorMessage -Level Error
+            throw $ErrorMessage
+        }
+    }
+    
+    end {
+        Write-IntuneInventoryLog -Message "LOB app content download operation completed" -Level Info -Source "Get-IntuneLobAppContent"
+    }
+}

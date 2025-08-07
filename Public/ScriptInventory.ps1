@@ -1,48 +1,54 @@
 function Invoke-IntuneScriptInventory {
     <#
     .SYNOPSIS
-    Inventories Intune PowerShell scripts and stores them in the database.
+    Inventories Intune device managemen                        try {
+                            $ScriptContentUri = "beta/deviceManagement/deviceManagementScripts/$($GraphScript.id)"
+                            $ScriptDetails = Invoke-GraphRequest -Uri $ScriptContentUri -Method GETcripts and stores them in JSON storage.
     
     .DESCRIPTION
-    Retrieves all Intune PowerShell scripts from Microsoft Graph and stores comprehensive
-    information including metadata, script content, and assignments in the SQLite database.
+    Retrieves all Intune device management scripts from Microsoft Graph and stores comprehensive
+    information including metadata, assignments, and source code in JSON files.
     
     .PARAMETER IncludeAssignments
     Include assignment information for each script.
     
+    .PARAMETER IncludeSourceCode
+    Include the actual script content in the inventory.
+    
     .PARAMETER Force
-    Force a complete re-inventory even if scripts already exist in the database.
+    Force a complete re-inventory even if scripts already exist in storage.
     
     .EXAMPLE
     Invoke-IntuneScriptInventory
     
     .EXAMPLE
-    Invoke-IntuneScriptInventory -IncludeAssignments -Force
+    Invoke-IntuneScriptInventory -IncludeAssignments -IncludeSourceCode -Force
     #>
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
         [Parameter()]
         [switch]$IncludeAssignments,
+        
+        [Parameter()]
+        [switch]$IncludeSourceCode,
         
         [Parameter()]
         [switch]$Force
     )
     
     begin {
-        Write-IntuneInventoryLog -Message "Starting Intune script inventory" -Level Info -Source "Invoke-IntuneScriptInventory"
+        Write-IntuneInventoryLog -Message "Starting script inventory collection" -Level Info -Source "Invoke-IntuneScriptInventory"
         
-        # Verify connections
-        if (-not $Script:DatabaseConnection -or -not (Test-DatabaseConnection -DatabaseConnection $Script:DatabaseConnection)) {
-            throw "Database connection is not available. Please run Connect-IntuneInventory first."
+        if (-not (Test-IntuneConnection)) {
+            throw "Microsoft Graph authentication is not valid. Please run Connect-IntuneInventory first."
         }
         
-        if (-not (Test-GraphAuthentication)) {
-            throw "Microsoft Graph authentication is not valid. Please run Connect-IntuneInventory first."
+        if (-not (Test-StorageConnection)) {
+            throw "JSON storage connection is not available. Please run Connect-IntuneInventory first."
         }
     }
     
     process {
-        $RunId = $null
         $StartTime = Get-Date
         $ItemsProcessed = 0
         $ErrorCount = 0
@@ -50,226 +56,256 @@ function Invoke-IntuneScriptInventory {
         
         try {
             # Create inventory run record
-            $UserContext = Get-CurrentUserContext
-            $Command = $Script:DatabaseConnection.CreateCommand()
-            $Command.CommandText = @"
-INSERT INTO InventoryRuns (RunType, StartTime, Status, TenantId, UserPrincipalName)
-VALUES (@RunType, @StartTime, @Status, @TenantId, @UserPrincipalName);
-SELECT last_insert_rowid();
-"@
-            $null = $Command.Parameters.AddWithValue("@RunType", "ScriptInventory")
-            $null = $Command.Parameters.AddWithValue("@StartTime", $StartTime.ToString("yyyy-MM-dd HH:mm:ss"))
-            $null = $Command.Parameters.AddWithValue("@Status", "Running")
-            $null = $Command.Parameters.AddWithValue("@TenantId", $UserContext.TenantId)
-            $null = $Command.Parameters.AddWithValue("@UserPrincipalName", $UserContext.UserPrincipalName)
+            $RunRecord = @{
+                Id = [guid]::NewGuid().ToString()
+                RunType = "ScriptInventory"
+                StartTime = $StartTime.ToString("yyyy-MM-dd HH:mm:ss")
+                Status = "Running"
+                TenantId = $Script:GraphConnection.TenantId
+                UserPrincipalName = $Script:GraphConnection.UserPrincipalName
+                ItemsProcessed = 0
+                ErrorCount = 0
+                ErrorMessages = @()
+                EndTime = $null
+                Duration = $null
+            }
             
-            $RunId = $Command.ExecuteScalar()
-            $Command.Dispose()
+            Add-InventoryItem -ItemType "InventoryRuns" -Item $RunRecord
+            Write-IntuneInventoryLog -Message "Created inventory run record: $($RunRecord.Id)" -Level Info
             
-            Write-IntuneInventoryLog -Message "Started script inventory run ID: $RunId" -Level Info
+            # Get all device management scripts from Graph using beta endpoint
+            Write-IntuneInventoryLog -Message "Retrieving scripts from Microsoft Graph (beta endpoint)" -Level Info
+            $GraphScripts = Get-GraphRequestAll -Uri "beta/deviceManagement/deviceManagementScripts"
             
-            # Get all device PowerShell scripts using Graph API
-            Write-IntuneInventoryLog -Message "Retrieving Intune PowerShell scripts..." -Level Info
-            $Scripts = Get-GraphRequestAll -Uri "v1.0/deviceManagement/deviceManagementScripts"
+            if (-not $GraphScripts -or $GraphScripts.Count -eq 0) {
+                Write-IntuneInventoryLog -Message "No scripts found in Intune" -Level Warning
+                return @{
+                    Success = $true
+                    ItemsProcessed = 0
+                    Message = "No scripts found"
+                    RunId = $RunRecord.Id
+                }
+            }
             
-            Write-IntuneInventoryLog -Message "Found $($Scripts.Count) scripts to process" -Level Info
+            Write-IntuneInventoryLog -Message "Found $($GraphScripts.Count) scripts to process" -Level Info
             
-            foreach ($Script in $Scripts) {
+            # Clear existing data if Force is specified
+            if ($Force) {
+                Write-IntuneInventoryLog -Message "Force parameter specified - clearing existing script data" -Level Info
+                $ScriptsPath = Join-Path $Script:StorageRoot "scripts.json"
+                Save-JsonData -FilePath $ScriptsPath -Data @()
+            }
+            
+            # Process each script
+            foreach ($GraphScript in $GraphScripts) {
                 try {
-                    if ($PSCmdlet.ShouldProcess($Script.displayName, "Inventory Intune script")) {
-                        Write-IntuneInventoryLog -Message "Processing script: $($Script.displayName)" -Level Verbose
-                        
-                        # Get script content
-                        $ScriptContent = ""
-                        $SourceCode = ""
+                    Write-IntuneInventoryLog -Message "Processing script: $($GraphScript.displayName) (ID: $($GraphScript.id))" -Level Verbose
+                    
+                    # Get script content if requested
+                    $ScriptContent = $null
+                    if ($IncludeSourceCode) {
                         try {
-                            $ScriptDetail = Invoke-GraphRequest -Uri "v1.0/deviceManagement/deviceManagementScripts/$($Script.id)" -Method GET
-                            if ($ScriptDetail.scriptContent) {
-                                # Script content is base64 encoded
-                                $ScriptBytes = [System.Convert]::FromBase64String($ScriptDetail.scriptContent)
-                                $ScriptContent = [System.Text.Encoding]::UTF8.GetString($ScriptBytes)
-                                $SourceCode = $ScriptContent
+                            $ScriptContentUri = "beta/deviceManagement/deviceManagementScripts/$($GraphScript.id)"
+                            $ScriptDetails = Invoke-GraphRequest -Uri $ScriptContentUri -Method GET
+                            if ($ScriptDetails.scriptContent) {
+                                $ScriptContent = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($ScriptDetails.scriptContent))
                             }
                         }
                         catch {
-                            Write-IntuneInventoryLog -Message "Could not retrieve script content for $($Script.displayName): $($_.Exception.Message)" -Level Warning
+                            Write-IntuneInventoryLog -Message "Failed to retrieve script content for '$($GraphScript.displayName)': $($_.Exception.Message)" -Level Warning
                         }
-                        
-                        # Insert or update script record
-                        $InsertCommand = $Script:DatabaseConnection.CreateCommand()
-                        $InsertCommand.CommandText = @"
-INSERT OR REPLACE INTO Scripts (
-    Id, DisplayName, Description, ScriptContent, CreatedDateTime, 
-    LastModifiedDateTime, RunAsAccount, FileName, RoleScopeTagIds,
-    HasSourceCode, SourceCode, SourceCodeAdded, InventoryDate, LastUpdated
-) VALUES (
-    @Id, @DisplayName, @Description, @ScriptContent, @CreatedDateTime,
-    @LastModifiedDateTime, @RunAsAccount, @FileName, @RoleScopeTagIds,
-    @HasSourceCode, @SourceCode, @SourceCodeAdded, @InventoryDate, @LastUpdated
-);
-"@
-                        
-                        # Add parameters
-                        $HasSourceCode = if ([string]::IsNullOrWhiteSpace($SourceCode)) { 0 } else { 1 }
-                        
-                        $null = $InsertCommand.Parameters.AddWithValue("@Id", $Script.id)
-                        $null = $InsertCommand.Parameters.AddWithValue("@DisplayName", $Script.displayName ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Description", $Script.description ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@ScriptContent", $ScriptContent)
-                        $null = $InsertCommand.Parameters.AddWithValue("@CreatedDateTime", $Script.createdDateTime ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@LastModifiedDateTime", $Script.lastModifiedDateTime ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@RunAsAccount", $Script.runAsAccount ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@FileName", $Script.fileName ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@RoleScopeTagIds", ($Script.roleScopeTagIds -join ", ") ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@HasSourceCode", $HasSourceCode)
-                        $null = $InsertCommand.Parameters.AddWithValue("@SourceCode", $SourceCode)
-                        $null = $InsertCommand.Parameters.AddWithValue("@SourceCodeAdded", $HasSourceCode -eq 1 ? $StartTime.ToString("yyyy-MM-dd HH:mm:ss") : "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@InventoryDate", $StartTime.ToString("yyyy-MM-dd HH:mm:ss"))
-                        $null = $InsertCommand.Parameters.AddWithValue("@LastUpdated", $StartTime.ToString("yyyy-MM-dd HH:mm:ss"))
-                        
-                        $null = $InsertCommand.ExecuteNonQuery()
-                        $InsertCommand.Dispose()
-                        
-                        # Process assignments if requested
-                        if ($IncludeAssignments) {
-                            try {
-                                $Assignments = Get-GraphRequestAll -Uri "v1.0/deviceManagement/deviceManagementScripts/$($Script.id)/assignments"
-                                foreach ($Assignment in $Assignments) {
-                                    # Process assignment (similar to application assignments)
-                                    Write-IntuneInventoryLog -Message "Processing assignment for script: $($Script.displayName)" -Level Verbose
-                                    # Add assignment processing logic here
+                    }
+                    
+                    # Create script record
+                    $ScriptRecord = New-Object System.Collections.Hashtable
+                    $ScriptRecord['Id'] = $GraphScript.id
+                    $ScriptRecord['DisplayName'] = $GraphScript.displayName
+                    $ScriptRecord['Description'] = $GraphScript.description
+                    $ScriptRecord['ScriptContent'] = $ScriptContent
+                    $ScriptRecord['ScriptContentEncoded'] = $GraphScript.scriptContent
+                    $ScriptRecord['RunAsAccount'] = $GraphScript.runAsAccount
+                    $ScriptRecord['FileName'] = $GraphScript.fileName
+                    $ScriptRecord['RoleScopeTagIds'] = $GraphScript.roleScopeTagIds
+                    $ScriptRecord['CreatedDateTime'] = $GraphScript.createdDateTime
+                    $ScriptRecord['LastModifiedDateTime'] = $GraphScript.lastModifiedDateTime
+                    $ScriptRecord['RunCount'] = $GraphScript.runCount
+                    $ScriptRecord['SuccessDeviceCount'] = $GraphScript.successDeviceCount
+                    $ScriptRecord['ErrorDeviceCount'] = $GraphScript.errorDeviceCount
+                    $ScriptRecord['PendingDeviceCount'] = $GraphScript.pendingDeviceCount
+                    $ScriptRecord['HasSourceCode'] = if ($ScriptContent) { $true } else { $false }
+                    $ScriptRecord['SourceCodePath'] = $null
+                    $ScriptRecord['LastInventoried'] = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                    $ScriptRecord['InventoryRunId'] = $RunRecord.Id
+                    
+                    # Add the script to storage
+                    Add-InventoryItem -ItemType "Scripts" -Item $ScriptRecord
+                    
+                    # Process assignments if requested
+                    if ($IncludeAssignments) {
+                        try {
+                            Write-IntuneInventoryLog -Message "Retrieving assignments for script: $($GraphScript.displayName)" -Level Verbose
+                            $AssignmentsUri = "beta/deviceManagement/deviceManagementScripts/$($GraphScript.id)/assignments"
+                            $ScriptAssignments = Get-GraphRequestAll -Uri $AssignmentsUri
+                            
+                            if ($ScriptAssignments -and $ScriptAssignments.Count -gt 0) {
+                                # Resolve group IDs to display names
+                                $ScriptAssignments = Resolve-GroupAssignments -Assignments $ScriptAssignments
+                                
+                                foreach ($Assignment in $ScriptAssignments) {
+                                    $AssignmentRecord = @{
+                                        Id = $Assignment.id
+                                        ObjectId = $GraphScript.id
+                                        ObjectType = "Script"
+                                        ObjectName = $GraphScript.displayName
+                                        Target = ConvertTo-SafeJson -InputObject $Assignment.target
+                                        TargetType = $Assignment.target.'@odata.type'
+                                        TargetId = $Assignment.target.deviceAndAppManagementAssignmentFilterId
+                                        TargetGroupId = $Assignment.target.groupId
+                                        GroupDisplayNames = $Assignment.GroupDisplayNames
+                                        TargetDisplayName = $Assignment.TargetDisplayName
+                                        FilterType = $Assignment.target.deviceAndAppManagementAssignmentFilterType
+                                        LastModifiedDateTime = $Assignment.lastModifiedDateTime
+                                        CreatedDateTime = $Assignment.createdDateTime
+                                        LastInventoried = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                                        InventoryRunId = $RunRecord.Id
+                                    }
+                                    
+                                    Add-InventoryItem -ItemType "Assignments" -Item $AssignmentRecord
                                 }
-                            }
-                            catch {
-                                Write-IntuneInventoryLog -Message "Could not retrieve assignments for script $($Script.displayName): $($_.Exception.Message)" -Level Warning
-                                $ErrorCount++
-                                $ErrorMessages += "Assignment error for script $($Script.displayName): $($_.Exception.Message)"
+                                
+                                Write-IntuneInventoryLog -Message "Processed $($ScriptAssignments.Count) assignments for script: $($GraphScript.displayName)" -Level Verbose
                             }
                         }
-                        
-                        $ItemsProcessed++
-                        
-                        if ($ItemsProcessed % 5 -eq 0) {
-                            Write-Progress -Activity "Inventorying Scripts" -Status "Processed $ItemsProcessed of $($Scripts.Count)" -PercentComplete (($ItemsProcessed / $Scripts.Count) * 100)
+                        catch {
+                            $ErrorCount++
+                            $ErrorMessage = "Failed to retrieve assignments for script '$($GraphScript.displayName)': $($_.Exception.Message)"
+                            $ErrorMessages += $ErrorMessage
+                            Write-IntuneInventoryLog -Message $ErrorMessage -Level Warning
                         }
+                    }
+                    
+                    $ItemsProcessed++
+                    
+                    if ($ItemsProcessed % 10 -eq 0) {
+                        Write-IntuneInventoryLog -Message "Processed $ItemsProcessed scripts so far..." -Level Info
                     }
                 }
                 catch {
-                    Write-IntuneInventoryLog -Message "Error processing script $($Script.displayName): $($_.Exception.Message)" -Level Error
                     $ErrorCount++
-                    $ErrorMessages += "Error processing script $($Script.displayName): $($_.Exception.Message)"
+                    $ErrorMessage = "Failed to process script '$($GraphScript.displayName)': $($_.Exception.Message)"
+                    $ErrorMessages += $ErrorMessage
+                    Write-IntuneInventoryLog -Message $ErrorMessage -Level Error
                 }
             }
-            
-            Write-Progress -Activity "Inventorying Scripts" -Completed
             
             # Update inventory run record
             $EndTime = Get-Date
-            $UpdateCommand = $Script:DatabaseConnection.CreateCommand()
-            $UpdateCommand.CommandText = @"
-UPDATE InventoryRuns 
-SET EndTime = @EndTime, Status = @Status, ItemsProcessed = @ItemsProcessed, 
-    ErrorCount = @ErrorCount, ErrorMessages = @ErrorMessages
-WHERE Id = @RunId;
-"@
-            $null = $UpdateCommand.Parameters.AddWithValue("@EndTime", $EndTime.ToString("yyyy-MM-dd HH:mm:ss"))
-            $null = $UpdateCommand.Parameters.AddWithValue("@Status", "Completed")
-            $null = $UpdateCommand.Parameters.AddWithValue("@ItemsProcessed", $ItemsProcessed)
-            $null = $UpdateCommand.Parameters.AddWithValue("@ErrorCount", $ErrorCount)
-            $null = $UpdateCommand.Parameters.AddWithValue("@ErrorMessages", ($ErrorMessages -join "; "))
-            $null = $UpdateCommand.Parameters.AddWithValue("@RunId", $RunId)
+            $Duration = ($EndTime - $StartTime).TotalMinutes
             
-            $null = $UpdateCommand.ExecuteNonQuery()
-            $UpdateCommand.Dispose()
+            $RunRecord.Status = if ($ErrorCount -eq 0) { "Completed" } else { "CompletedWithErrors" }
+            $RunRecord.ItemsProcessed = $ItemsProcessed
+            $RunRecord.ErrorCount = $ErrorCount
+            $RunRecord.ErrorMessages = $ErrorMessages
+            $RunRecord.EndTime = $EndTime.ToString("yyyy-MM-dd HH:mm:ss")
+            $RunRecord.Duration = [math]::Round($Duration, 2)
             
-            Write-IntuneInventoryLog -Message "Script inventory completed. Processed: $ItemsProcessed, Errors: $ErrorCount" -Level Info
-            Write-Host "Script inventory completed!" -ForegroundColor Green
-            Write-Host "Scripts processed: $ItemsProcessed" -ForegroundColor Cyan
+            Add-InventoryItem -ItemType "InventoryRuns" -Item $RunRecord
+            
+            $SuccessMessage = "Script inventory completed successfully. Processed $ItemsProcessed scripts"
             if ($ErrorCount -gt 0) {
-                Write-Host "Errors encountered: $ErrorCount" -ForegroundColor Yellow
+                $SuccessMessage += " with $ErrorCount errors"
+            }
+            
+            Write-IntuneInventoryLog -Message $SuccessMessage -Level Info
+            
+            return @{
+                Success = $true
+                ItemsProcessed = $ItemsProcessed
+                ErrorCount = $ErrorCount
+                ErrorMessages = $ErrorMessages
+                Duration = $Duration
+                RunId = $RunRecord.Id
+                Message = $SuccessMessage
             }
         }
         catch {
-            # Update inventory run with error status
-            if ($RunId) {
+            $ErrorMessage = "Critical error during script inventory: $($_.Exception.Message)"
+            Write-IntuneInventoryLog -Message $ErrorMessage -Level Error
+            
+            # Update run record with error status
+            if ($RunRecord) {
+                $RunRecord.Status = "Failed"
+                $RunRecord.ErrorCount = $ErrorCount + 1
+                $RunRecord.ErrorMessages = $ErrorMessages + $ErrorMessage
+                $RunRecord.EndTime = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                $RunRecord.Duration = [math]::Round(((Get-Date) - $StartTime).TotalMinutes, 2)
+                
                 try {
-                    $ErrorCommand = $Script:DatabaseConnection.CreateCommand()
-                    $ErrorCommand.CommandText = @"
-UPDATE InventoryRuns 
-SET EndTime = @EndTime, Status = @Status, ItemsProcessed = @ItemsProcessed, 
-    ErrorCount = @ErrorCount, ErrorMessages = @ErrorMessages
-WHERE Id = @RunId;
-"@
-                    $null = $ErrorCommand.Parameters.AddWithValue("@EndTime", (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
-                    $null = $ErrorCommand.Parameters.AddWithValue("@Status", "Failed")
-                    $null = $ErrorCommand.Parameters.AddWithValue("@ItemsProcessed", $ItemsProcessed)
-                    $null = $ErrorCommand.Parameters.AddWithValue("@ErrorCount", $ErrorCount + 1)
-                    $null = $ErrorCommand.Parameters.AddWithValue("@ErrorMessages", ($ErrorMessages + $_.Exception.Message) -join "; ")
-                    $null = $ErrorCommand.Parameters.AddWithValue("@RunId", $RunId)
-                    
-                    $null = $ErrorCommand.ExecuteNonQuery()
-                    $ErrorCommand.Dispose()
+                    Add-InventoryItem -ItemType "InventoryRuns" -Item $RunRecord
                 }
                 catch {
-                    Write-IntuneInventoryLog -Message "Failed to update inventory run with error status: $($_.Exception.Message)" -Level Warning
+                    Write-IntuneInventoryLog -Message "Failed to update run record: $($_.Exception.Message)" -Level Error
                 }
             }
             
-            Write-IntuneInventoryLog -Message "Script inventory failed: $($_.Exception.Message)" -Level Error
-            throw
+            throw $ErrorMessage
         }
     }
     
     end {
-        Write-IntuneInventoryLog -Message "Script inventory process completed" -Level Info -Source "Invoke-IntuneScriptInventory"
+        Write-IntuneInventoryLog -Message "Script inventory operation completed" -Level Info -Source "Invoke-IntuneScriptInventory"
     }
 }
 
 function Invoke-IntuneRemediationInventory {
     <#
     .SYNOPSIS
-    Inventories Intune remediation scripts (proactive remediations) and stores them in the database.
+    Inventories Intune remediation scripts and stores them in JSON storage.
     
     .DESCRIPTION
-    Retrieves all Intune remediation scripts from Microsoft Graph and stores comprehensive
-    information including metadata, detection and remediation script content, and assignments.
+    Retrieves all Intune remediation scripts (proactive remediations) from Microsoft Graph and stores comprehensive
+    information including metadata, assignments, and source code in JSON files.
     
     .PARAMETER IncludeAssignments
     Include assignment information for each remediation.
     
+    .PARAMETER IncludeSourceCode
+    Include the actual script content (detection and remediation) in the inventory.
+    
     .PARAMETER Force
-    Force a complete re-inventory even if remediations already exist in the database.
+    Force a complete re-inventory even if remediations already exist in storage.
     
     .EXAMPLE
     Invoke-IntuneRemediationInventory
     
     .EXAMPLE
-    Invoke-IntuneRemediationInventory -IncludeAssignments -Force
+    Invoke-IntuneRemediationInventory -IncludeAssignments -IncludeSourceCode -Force
     #>
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
         [Parameter()]
         [switch]$IncludeAssignments,
+        
+        [Parameter()]
+        [switch]$IncludeSourceCode,
         
         [Parameter()]
         [switch]$Force
     )
     
     begin {
-        Write-IntuneInventoryLog -Message "Starting Intune remediation inventory" -Level Info -Source "Invoke-IntuneRemediationInventory"
+        Write-IntuneInventoryLog -Message "Starting remediation inventory collection" -Level Info -Source "Invoke-IntuneRemediationInventory"
         
-        # Verify connections
-        if (-not $Script:DatabaseConnection -or -not (Test-DatabaseConnection -DatabaseConnection $Script:DatabaseConnection)) {
-            throw "Database connection is not available. Please run Connect-IntuneInventory first."
+        if (-not (Test-IntuneConnection)) {
+            throw "Microsoft Graph authentication is not valid. Please run Connect-IntuneInventory first."
         }
         
-        if (-not (Test-GraphAuthentication)) {
-            throw "Microsoft Graph authentication is not valid. Please run Connect-IntuneInventory first."
+        if (-not (Test-StorageConnection)) {
+            throw "JSON storage connection is not available. Please run Connect-IntuneInventory first."
         }
     }
     
     process {
-        $RunId = $null
         $StartTime = Get-Date
         $ItemsProcessed = 0
         $ErrorCount = 0
@@ -277,195 +313,215 @@ function Invoke-IntuneRemediationInventory {
         
         try {
             # Create inventory run record
-            $UserContext = Get-CurrentUserContext
-            $Command = $Script:DatabaseConnection.CreateCommand()
-            $Command.CommandText = @"
-INSERT INTO InventoryRuns (RunType, StartTime, Status, TenantId, UserPrincipalName)
-VALUES (@RunType, @StartTime, @Status, @TenantId, @UserPrincipalName);
-SELECT last_insert_rowid();
-"@
-            $null = $Command.Parameters.AddWithValue("@RunType", "RemediationInventory")
-            $null = $Command.Parameters.AddWithValue("@StartTime", $StartTime.ToString("yyyy-MM-dd HH:mm:ss"))
-            $null = $Command.Parameters.AddWithValue("@Status", "Running")
-            $null = $Command.Parameters.AddWithValue("@TenantId", $UserContext.TenantId)
-            $null = $Command.Parameters.AddWithValue("@UserPrincipalName", $UserContext.UserPrincipalName)
+            $RunRecord = @{
+                Id = [guid]::NewGuid().ToString()
+                RunType = "RemediationInventory"
+                StartTime = $StartTime.ToString("yyyy-MM-dd HH:mm:ss")
+                Status = "Running"
+                TenantId = $Script:GraphConnection.TenantId
+                UserPrincipalName = $Script:GraphConnection.UserPrincipalName
+                ItemsProcessed = 0
+                ErrorCount = 0
+                ErrorMessages = @()
+                EndTime = $null
+                Duration = $null
+            }
             
-            $RunId = $Command.ExecuteScalar()
-            $Command.Dispose()
+            Add-InventoryItem -ItemType "InventoryRuns" -Item $RunRecord
+            Write-IntuneInventoryLog -Message "Created inventory run record: $($RunRecord.Id)" -Level Info
             
-            Write-IntuneInventoryLog -Message "Started remediation inventory run ID: $RunId" -Level Info
+            # Get all device health scripts (remediations) from Graph using beta endpoint
+            Write-IntuneInventoryLog -Message "Retrieving remediations from Microsoft Graph (beta endpoint)" -Level Info
+            $GraphRemediations = Get-GraphRequestAll -Uri "beta/deviceManagement/deviceHealthScripts"
             
-            # Get all device health scripts (remediations) using Graph API
-            Write-IntuneInventoryLog -Message "Retrieving Intune remediation scripts..." -Level Info
-            $Remediations = Get-GraphRequestAll -Uri "v1.0/deviceManagement/deviceHealthScripts"
+            if (-not $GraphRemediations -or $GraphRemediations.Count -eq 0) {
+                Write-IntuneInventoryLog -Message "No remediations found in Intune" -Level Warning
+                return @{
+                    Success = $true
+                    ItemsProcessed = 0
+                    Message = "No remediations found"
+                    RunId = $RunRecord.Id
+                }
+            }
             
-            Write-IntuneInventoryLog -Message "Found $($Remediations.Count) remediations to process" -Level Info
+            Write-IntuneInventoryLog -Message "Found $($GraphRemediations.Count) remediations to process" -Level Info
             
-            foreach ($Remediation in $Remediations) {
+            # Clear existing data if Force is specified
+            if ($Force) {
+                Write-IntuneInventoryLog -Message "Force parameter specified - clearing existing remediation data" -Level Info
+                $RemediationsPath = Join-Path $Script:StorageRoot "remediations.json"
+                Save-JsonData -FilePath $RemediationsPath -Data @()
+            }
+            
+            # Process each remediation
+            foreach ($GraphRemediation in $GraphRemediations) {
                 try {
-                    if ($PSCmdlet.ShouldProcess($Remediation.displayName, "Inventory Intune remediation")) {
-                        Write-IntuneInventoryLog -Message "Processing remediation: $($Remediation.displayName)" -Level Verbose
-                        
-                        # Get remediation script content
-                        $DetectionScriptContent = ""
-                        $RemediationScriptContent = ""
-                        $SourceCode = ""
-                        
+                    Write-IntuneInventoryLog -Message "Processing remediation: $($GraphRemediation.displayName) (ID: $($GraphRemediation.id))" -Level Verbose
+                    
+                    # Get remediation content if requested
+                    $DetectionScriptContent = $null
+                    $RemediationScriptContent = $null
+                    if ($IncludeSourceCode) {
                         try {
-                            # Get detection script
-                            if ($Remediation.detectionScriptContent) {
-                                $DetectionBytes = [System.Convert]::FromBase64String($Remediation.detectionScriptContent)
-                                $DetectionScriptContent = [System.Text.Encoding]::UTF8.GetString($DetectionBytes)
-                            }
+                            $RemediationDetailsUri = "beta/deviceManagement/deviceHealthScripts/$($GraphRemediation.id)"
+                            $RemediationDetails = Invoke-GraphRequest -Uri $RemediationDetailsUri -Method GET
                             
-                            # Get remediation script
-                            if ($Remediation.remediationScriptContent) {
-                                $RemediationBytes = [System.Convert]::FromBase64String($Remediation.remediationScriptContent)
-                                $RemediationScriptContent = [System.Text.Encoding]::UTF8.GetString($RemediationBytes)
+                            if ($RemediationDetails.detectionScriptContent) {
+                                $DetectionScriptContent = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($RemediationDetails.detectionScriptContent))
                             }
-                            
-                            # Combine scripts for source code
-                            if ($DetectionScriptContent -or $RemediationScriptContent) {
-                                $SourceCode = @{
-                                    DetectionScript = $DetectionScriptContent
-                                    RemediationScript = $RemediationScriptContent
-                                } | ConvertTo-SafeJson
+                            if ($RemediationDetails.remediationScriptContent) {
+                                $RemediationScriptContent = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($RemediationDetails.remediationScriptContent))
                             }
                         }
                         catch {
-                            Write-IntuneInventoryLog -Message "Could not retrieve script content for remediation $($Remediation.displayName): $($_.Exception.Message)" -Level Warning
+                            Write-IntuneInventoryLog -Message "Failed to retrieve script content for '$($GraphRemediation.displayName)': $($_.Exception.Message)" -Level Warning
                         }
-                        
-                        # Insert or update remediation record
-                        $InsertCommand = $Script:DatabaseConnection.CreateCommand()
-                        $InsertCommand.CommandText = @"
-INSERT OR REPLACE INTO Remediations (
-    Id, DisplayName, Description, Publisher, Version, CreatedDateTime, 
-    LastModifiedDateTime, DetectionScriptContent, RemediationScriptContent, 
-    RunAsAccount, RoleScopeTagIds, HasSourceCode, SourceCode, SourceCodeAdded, 
-    InventoryDate, LastUpdated
-) VALUES (
-    @Id, @DisplayName, @Description, @Publisher, @Version, @CreatedDateTime,
-    @LastModifiedDateTime, @DetectionScriptContent, @RemediationScriptContent,
-    @RunAsAccount, @RoleScopeTagIds, @HasSourceCode, @SourceCode, @SourceCodeAdded,
-    @InventoryDate, @LastUpdated
-);
-"@
-                        
-                        # Add parameters
-                        $HasSourceCode = if ([string]::IsNullOrWhiteSpace($SourceCode)) { 0 } else { 1 }
-                        
-                        $null = $InsertCommand.Parameters.AddWithValue("@Id", $Remediation.id)
-                        $null = $InsertCommand.Parameters.AddWithValue("@DisplayName", $Remediation.displayName ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Description", $Remediation.description ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Publisher", $Remediation.publisher ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Version", $Remediation.version ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@CreatedDateTime", $Remediation.createdDateTime?.ToString("yyyy-MM-dd HH:mm:ss") ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@LastModifiedDateTime", $Remediation.lastModifiedDateTime?.ToString("yyyy-MM-dd HH:mm:ss") ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@DetectionScriptContent", $DetectionScriptContent)
-                        $null = $InsertCommand.Parameters.AddWithValue("@RemediationScriptContent", $RemediationScriptContent)
-                        $null = $InsertCommand.Parameters.AddWithValue("@RunAsAccount", $Remediation.runAsAccount ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@RoleScopeTagIds", ($Remediation.roleScopeTagIds -join ", ") ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@HasSourceCode", $HasSourceCode)
-                        $null = $InsertCommand.Parameters.AddWithValue("@SourceCode", $SourceCode)
-                        $null = $InsertCommand.Parameters.AddWithValue("@SourceCodeAdded", $HasSourceCode -eq 1 ? $StartTime.ToString("yyyy-MM-dd HH:mm:ss") : "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@InventoryDate", $StartTime.ToString("yyyy-MM-dd HH:mm:ss"))
-                        $null = $InsertCommand.Parameters.AddWithValue("@LastUpdated", $StartTime.ToString("yyyy-MM-dd HH:mm:ss"))
-                        
-                        $null = $InsertCommand.ExecuteNonQuery()
-                        $InsertCommand.Dispose()
-                        
-                        # Process assignments if requested
-                        if ($IncludeAssignments) {
-                            try {
-                                $Assignments = Get-GraphRequestAll -Uri "v1.0/deviceManagement/deviceHealthScripts/$($Remediation.id)/assignments"
-                                foreach ($Assignment in $Assignments) {
-                                    # Process assignment (similar to other assignments)
-                                    Write-IntuneInventoryLog -Message "Processing assignment for remediation: $($Remediation.displayName)" -Level Verbose
-                                    # Add assignment processing logic here
+                    }
+                    
+                    # Create remediation record
+                    $RemediationRecord = New-Object System.Collections.Hashtable
+                    $RemediationRecord['Id'] = $GraphRemediation.id
+                    $RemediationRecord['DisplayName'] = $GraphRemediation.displayName
+                    $RemediationRecord['Description'] = $GraphRemediation.description
+                    $RemediationRecord['DetectionScriptContent'] = $DetectionScriptContent
+                    $RemediationRecord['RemediationScriptContent'] = $RemediationScriptContent
+                    $RemediationRecord['DetectionScriptContentEncoded'] = $GraphRemediation.detectionScriptContent
+                    $RemediationRecord['RemediationScriptContentEncoded'] = $GraphRemediation.remediationScriptContent
+                    $RemediationRecord['RunAsAccount'] = $GraphRemediation.runAsAccount
+                    $RemediationRecord['EnforceSignatureCheck'] = $GraphRemediation.enforceSignatureCheck
+                    $RemediationRecord['RunAs32Bit'] = $GraphRemediation.runAs32Bit
+                    $RemediationRecord['RoleScopeTagIds'] = $GraphRemediation.roleScopeTagIds
+                    $RemediationRecord['IsGlobalScript'] = $GraphRemediation.isGlobalScript
+                    $RemediationRecord['HighestAvailableVersion'] = $GraphRemediation.highestAvailableVersion
+                    $RemediationRecord['Publisher'] = $GraphRemediation.publisher
+                    $RemediationRecord['Version'] = $GraphRemediation.version
+                    $RemediationRecord['CreatedDateTime'] = $GraphRemediation.createdDateTime
+                    $RemediationRecord['LastModifiedDateTime'] = $GraphRemediation.lastModifiedDateTime
+                    $RemediationRecord['RunSummary'] = $GraphRemediation.runSummary
+                    $RemediationRecord['DeviceRunStates'] = $GraphRemediation.deviceRunStates
+                    $RemediationRecord['HasSourceCode'] = if ($DetectionScriptContent -or $RemediationScriptContent) { $true } else { $false }
+                    $RemediationRecord['SourceCodePath'] = $null
+                    $RemediationRecord['LastInventoried'] = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                    $RemediationRecord['InventoryRunId'] = $RunRecord.Id
+                    
+                    # Add the remediation to storage
+                    Add-InventoryItem -ItemType "Remediations" -Item $RemediationRecord
+                    
+                    # Process assignments if requested
+                    if ($IncludeAssignments) {
+                        try {
+                            Write-IntuneInventoryLog -Message "Retrieving assignments for remediation: $($GraphRemediation.displayName)" -Level Verbose
+                            $AssignmentsUri = "beta/deviceManagement/deviceHealthScripts/$($GraphRemediation.id)/assignments"
+                            $RemediationAssignments = Get-GraphRequestAll -Uri $AssignmentsUri
+                            
+                            if ($RemediationAssignments -and $RemediationAssignments.Count -gt 0) {
+                                # Resolve group IDs to display names
+                                $RemediationAssignments = Resolve-GroupAssignments -Assignments $RemediationAssignments
+                                
+                                foreach ($Assignment in $RemediationAssignments) {
+                                    $AssignmentRecord = @{
+                                        Id = $Assignment.id
+                                        ObjectId = $GraphRemediation.id
+                                        ObjectType = "Remediation"
+                                        ObjectName = $GraphRemediation.displayName
+                                        Target = ConvertTo-SafeJson -InputObject $Assignment.target
+                                        TargetType = $Assignment.target.'@odata.type'
+                                        TargetId = $Assignment.target.deviceAndAppManagementAssignmentFilterId
+                                        TargetGroupId = $Assignment.target.groupId
+                                        GroupDisplayNames = $Assignment.GroupDisplayNames
+                                        TargetDisplayName = $Assignment.TargetDisplayName
+                                        FilterType = $Assignment.target.deviceAndAppManagementAssignmentFilterType
+                                        RunRemediationScript = $Assignment.runRemediationScript
+                                        RunSchedule = $Assignment.runSchedule
+                                        LastModifiedDateTime = $Assignment.lastModifiedDateTime
+                                        CreatedDateTime = $Assignment.createdDateTime
+                                        LastInventoried = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                                        InventoryRunId = $RunRecord.Id
+                                    }
+                                    
+                                    Add-InventoryItem -ItemType "Assignments" -Item $AssignmentRecord
                                 }
-                            }
-                            catch {
-                                Write-IntuneInventoryLog -Message "Could not retrieve assignments for remediation $($Remediation.displayName): $($_.Exception.Message)" -Level Warning
-                                $ErrorCount++
-                                $ErrorMessages += "Assignment error for remediation $($Remediation.displayName): $($_.Exception.Message)"
+                                
+                                Write-IntuneInventoryLog -Message "Processed $($RemediationAssignments.Count) assignments for remediation: $($GraphRemediation.displayName)" -Level Verbose
                             }
                         }
-                        
-                        $ItemsProcessed++
-                        
-                        if ($ItemsProcessed % 5 -eq 0) {
-                            Write-Progress -Activity "Inventorying Remediations" -Status "Processed $ItemsProcessed of $($Remediations.Count)" -PercentComplete (($ItemsProcessed / $Remediations.Count) * 100)
+                        catch {
+                            $ErrorCount++
+                            $ErrorMessage = "Failed to retrieve assignments for remediation '$($GraphRemediation.displayName)': $($_.Exception.Message)"
+                            $ErrorMessages += $ErrorMessage
+                            Write-IntuneInventoryLog -Message $ErrorMessage -Level Warning
                         }
+                    }
+                    
+                    $ItemsProcessed++
+                    
+                    if ($ItemsProcessed % 10 -eq 0) {
+                        Write-IntuneInventoryLog -Message "Processed $ItemsProcessed remediations so far..." -Level Info
                     }
                 }
                 catch {
-                    Write-IntuneInventoryLog -Message "Error processing remediation $($Remediation.displayName): $($_.Exception.Message)" -Level Error
                     $ErrorCount++
-                    $ErrorMessages += "Error processing remediation $($Remediation.displayName): $($_.Exception.Message)"
+                    $ErrorMessage = "Failed to process remediation '$($GraphRemediation.displayName)': $($_.Exception.Message)"
+                    $ErrorMessages += $ErrorMessage
+                    Write-IntuneInventoryLog -Message $ErrorMessage -Level Error
                 }
             }
-            
-            Write-Progress -Activity "Inventorying Remediations" -Completed
             
             # Update inventory run record
             $EndTime = Get-Date
-            $UpdateCommand = $Script:DatabaseConnection.CreateCommand()
-            $UpdateCommand.CommandText = @"
-UPDATE InventoryRuns 
-SET EndTime = @EndTime, Status = @Status, ItemsProcessed = @ItemsProcessed, 
-    ErrorCount = @ErrorCount, ErrorMessages = @ErrorMessages
-WHERE Id = @RunId;
-"@
-            $null = $UpdateCommand.Parameters.AddWithValue("@EndTime", $EndTime.ToString("yyyy-MM-dd HH:mm:ss"))
-            $null = $UpdateCommand.Parameters.AddWithValue("@Status", "Completed")
-            $null = $UpdateCommand.Parameters.AddWithValue("@ItemsProcessed", $ItemsProcessed)
-            $null = $UpdateCommand.Parameters.AddWithValue("@ErrorCount", $ErrorCount)
-            $null = $UpdateCommand.Parameters.AddWithValue("@ErrorMessages", ($ErrorMessages -join "; "))
-            $null = $UpdateCommand.Parameters.AddWithValue("@RunId", $RunId)
+            $Duration = ($EndTime - $StartTime).TotalMinutes
             
-            $null = $UpdateCommand.ExecuteNonQuery()
-            $UpdateCommand.Dispose()
+            $RunRecord.Status = if ($ErrorCount -eq 0) { "Completed" } else { "CompletedWithErrors" }
+            $RunRecord.ItemsProcessed = $ItemsProcessed
+            $RunRecord.ErrorCount = $ErrorCount
+            $RunRecord.ErrorMessages = $ErrorMessages
+            $RunRecord.EndTime = $EndTime.ToString("yyyy-MM-dd HH:mm:ss")
+            $RunRecord.Duration = [math]::Round($Duration, 2)
             
-            Write-IntuneInventoryLog -Message "Remediation inventory completed. Processed: $ItemsProcessed, Errors: $ErrorCount" -Level Info
-            Write-Host "Remediation inventory completed!" -ForegroundColor Green
-            Write-Host "Remediations processed: $ItemsProcessed" -ForegroundColor Cyan
+            Add-InventoryItem -ItemType "InventoryRuns" -Item $RunRecord
+            
+            $SuccessMessage = "Remediation inventory completed successfully. Processed $ItemsProcessed remediations"
             if ($ErrorCount -gt 0) {
-                Write-Host "Errors encountered: $ErrorCount" -ForegroundColor Yellow
+                $SuccessMessage += " with $ErrorCount errors"
+            }
+            
+            Write-IntuneInventoryLog -Message $SuccessMessage -Level Info
+            
+            return @{
+                Success = $true
+                ItemsProcessed = $ItemsProcessed
+                ErrorCount = $ErrorCount
+                ErrorMessages = $ErrorMessages
+                Duration = $Duration
+                RunId = $RunRecord.Id
+                Message = $SuccessMessage
             }
         }
         catch {
-            # Update inventory run with error status
-            if ($RunId) {
+            $ErrorMessage = "Critical error during remediation inventory: $($_.Exception.Message)"
+            Write-IntuneInventoryLog -Message $ErrorMessage -Level Error
+            
+            # Update run record with error status
+            if ($RunRecord) {
+                $RunRecord.Status = "Failed"
+                $RunRecord.ErrorCount = $ErrorCount + 1
+                $RunRecord.ErrorMessages = $ErrorMessages + $ErrorMessage
+                $RunRecord.EndTime = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                $RunRecord.Duration = [math]::Round(((Get-Date) - $StartTime).TotalMinutes, 2)
+                
                 try {
-                    $ErrorCommand = $Script:DatabaseConnection.CreateCommand()
-                    $ErrorCommand.CommandText = @"
-UPDATE InventoryRuns 
-SET EndTime = @EndTime, Status = @Status, ItemsProcessed = @ItemsProcessed, 
-    ErrorCount = @ErrorCount, ErrorMessages = @ErrorMessages
-WHERE Id = @RunId;
-"@
-                    $null = $ErrorCommand.Parameters.AddWithValue("@EndTime", (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
-                    $null = $ErrorCommand.Parameters.AddWithValue("@Status", "Failed")
-                    $null = $ErrorCommand.Parameters.AddWithValue("@ItemsProcessed", $ItemsProcessed)
-                    $null = $ErrorCommand.Parameters.AddWithValue("@ErrorCount", $ErrorCount + 1)
-                    $null = $ErrorCommand.Parameters.AddWithValue("@ErrorMessages", ($ErrorMessages + $_.Exception.Message) -join "; ")
-                    $null = $ErrorCommand.Parameters.AddWithValue("@RunId", $RunId)
-                    
-                    $null = $ErrorCommand.ExecuteNonQuery()
-                    $ErrorCommand.Dispose()
+                    Add-InventoryItem -ItemType "InventoryRuns" -Item $RunRecord
                 }
                 catch {
-                    Write-IntuneInventoryLog -Message "Failed to update inventory run with error status: $($_.Exception.Message)" -Level Warning
+                    Write-IntuneInventoryLog -Message "Failed to update run record: $($_.Exception.Message)" -Level Error
                 }
             }
             
-            Write-IntuneInventoryLog -Message "Remediation inventory failed: $($_.Exception.Message)" -Level Error
-            throw
+            throw $ErrorMessage
         }
     }
     
     end {
-        Write-IntuneInventoryLog -Message "Remediation inventory process completed" -Level Info -Source "Invoke-IntuneRemediationInventory"
+        Write-IntuneInventoryLog -Message "Remediation inventory operation completed" -Level Info -Source "Invoke-IntuneRemediationInventory"
     }
 }

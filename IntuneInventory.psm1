@@ -1,13 +1,12 @@
 # IntuneInventory PowerShell Module
 # Main module file for Intune application, script, and remediation inventory
+# Uses JSON-based storage for user-friendly data management
 
-# Import required assemblies for SQLite
-Add-Type -Path (Join-Path $PSScriptRoot "System.Data.SQLite.dll") -ErrorAction SilentlyContinue
-
-# Module variables
+# Module variables for JSON storage system
 $Script:IntuneConnection = $null
-$Script:DatabasePath = $null
-$Script:DatabaseConnection = $null
+$Script:StorageRoot = $null
+$Script:StoragePaths = @{}
+$Script:InventoryData = @{}
 
 # Import functions from subdirectories
 $FunctionDirectories = @('Private', 'Public')
@@ -27,18 +26,8 @@ foreach ($Directory in $FunctionDirectories) {
     }
 }
 
-# Module cleanup - Production pattern
+# Module cleanup - Production pattern with JSON storage
 $MyInvocation.MyCommand.ScriptBlock.Module.OnRemove = {
-    if ($Script:DatabaseConnection) {
-        try {
-            $Script:DatabaseConnection.Close()
-            $Script:DatabaseConnection.Dispose()
-        }
-        catch {
-            Write-Warning "Error closing database connection: $($_.Exception.Message)"
-        }
-    }
-    
     # Clean up Graph authentication resources
     if ($Script:GraphToken) {
         try {
@@ -51,13 +40,25 @@ $MyInvocation.MyCommand.ScriptBlock.Module.OnRemove = {
             Write-Warning "Error clearing Graph authentication: $($_.Exception.Message)"
         }
     }
+    
+    # Clean up JSON storage resources
+    try {
+        $Script:StorageRoot = $null
+        $Script:StoragePaths = @{}
+        $Script:InventoryData = @{}
+    }
+    catch {
+        Write-Warning "Error clearing storage resources: $($_.Exception.Message)"
+    }
 }
 
 # Export module members (defined in manifest)
 Export-ModuleMember -Function @(
-    'Initialize-IntuneInventoryDatabase',
+    'Initialize-IntuneInventoryStorage',
     'Connect-IntuneInventory',
     'Disconnect-IntuneInventory',
+    'Test-IntuneConnection',
+    'Get-IntuneConnectionInfo',
     'Invoke-IntuneApplicationInventory',
     'Invoke-IntuneScriptInventory',
     'Invoke-IntuneRemediationInventory',
@@ -69,6 +70,7 @@ Export-ModuleMember -Function @(
     'Remove-IntuneInventoryItem',
     'Get-IntuneInventoryItem',
     'Get-IntuneInventoryAssignments',
-    'Backup-IntuneInventoryDatabase',
-    'Restore-IntuneInventoryDatabase'
+    'Backup-JsonStorage',
+    'Clear-StorageCache',
+    'Get-StorageStatistics'
 )

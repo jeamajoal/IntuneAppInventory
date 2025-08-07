@@ -1,17 +1,17 @@
 function Invoke-IntuneApplicationInventory {
     <#
     .SYNOPSIS
-    Inventories Intune applications and stores them in the database.
+    Inventories Intune applications and stores them in JSON storage.
     
     .DESCRIPTION
     Retrieves all Intune applications from Microsoft Graph and stores comprehensive
-    information including metadata, assignments, and source code indicators in the SQLite database.
+    information including metadata, assignments, and source code indicators in JSON files.
     
     .PARAMETER IncludeAssignments
     Include assignment information for each application.
     
     .PARAMETER Force
-    Force a complete re-inventory even if applications already exist in the database.
+    Force a complete re-inventory even if applications already exist in storage.
     
     .EXAMPLE
     Invoke-IntuneApplicationInventory
@@ -19,7 +19,7 @@ function Invoke-IntuneApplicationInventory {
     .EXAMPLE
     Invoke-IntuneApplicationInventory -IncludeAssignments -Force
     #>
-    [CmdletBinding(SupportsShouldProcess)]
+    [CmdletBinding()]
     param(
         [Parameter()]
         [switch]$IncludeAssignments,
@@ -29,20 +29,18 @@ function Invoke-IntuneApplicationInventory {
     )
     
     begin {
-        Write-IntuneInventoryLog -Message "Starting Intune application inventory" -Level Info -Source "Invoke-IntuneApplicationInventory"
+        Write-IntuneInventoryLog -Message "Starting application inventory collection" -Level Info -Source "Invoke-IntuneApplicationInventory"
         
-        # Verify connections
-        if (-not $Script:DatabaseConnection -or -not (Test-DatabaseConnection -DatabaseConnection $Script:DatabaseConnection)) {
-            throw "Database connection is not available. Please run Connect-IntuneInventory first."
+        if (-not (Test-IntuneConnection)) {
+            throw "Microsoft Graph authentication is not valid. Please run Connect-IntuneInventory first."
         }
         
-        if (-not (Test-GraphAuthentication)) {
-            throw "Microsoft Graph authentication is not valid. Please run Connect-IntuneInventory first."
+        if (-not (Test-StorageConnection)) {
+            throw "JSON storage connection is not available. Please run Connect-IntuneInventory first."
         }
     }
     
     process {
-        $RunId = $null
         $StartTime = Get-Date
         $ItemsProcessed = 0
         $ErrorCount = 0
@@ -50,194 +48,230 @@ function Invoke-IntuneApplicationInventory {
         
         try {
             # Create inventory run record
-            $UserContext = Get-CurrentUserContext
-            $Command = $Script:DatabaseConnection.CreateCommand()
-            $Command.CommandText = @"
-INSERT INTO InventoryRuns (RunType, StartTime, Status, TenantId, UserPrincipalName)
-VALUES (@RunType, @StartTime, @Status, @TenantId, @UserPrincipalName);
-SELECT last_insert_rowid();
-"@
-            $null = $Command.Parameters.AddWithValue("@RunType", "ApplicationInventory")
-            $null = $Command.Parameters.AddWithValue("@StartTime", $StartTime.ToString("yyyy-MM-dd HH:mm:ss"))
-            $null = $Command.Parameters.AddWithValue("@Status", "Running")
-            $null = $Command.Parameters.AddWithValue("@TenantId", $UserContext.TenantId)
-            $null = $Command.Parameters.AddWithValue("@UserPrincipalName", $UserContext.UserPrincipalName)
+            $RunRecord = @{
+                Id = [guid]::NewGuid().ToString()
+                RunType = "ApplicationInventory"
+                StartTime = $StartTime.ToString("yyyy-MM-dd HH:mm:ss")
+                Status = "Running"
+                TenantId = $Script:GraphConnection.TenantId
+                UserPrincipalName = $Script:GraphConnection.UserPrincipalName
+                ItemsProcessed = 0
+                ErrorCount = 0
+                ErrorMessages = @()
+                EndTime = $null
+                Duration = $null
+            }
             
-            $RunId = $Command.ExecuteScalar()
-            $Command.Dispose()
+            Add-InventoryItem -ItemType "InventoryRuns" -Item $RunRecord
+            Write-IntuneInventoryLog -Message "Created inventory run record: $($RunRecord.Id)" -Level Info
             
-            Write-IntuneInventoryLog -Message "Started inventory run ID: $RunId" -Level Info
+            # Get all mobile apps from Graph using beta endpoint for more complete data
+            Write-IntuneInventoryLog -Message "Retrieving applications from Microsoft Graph (beta endpoint)" -Level Info
+            $GraphApps = Get-GraphRequestAll -Uri "beta/deviceAppManagement/mobileApps"
             
-            # Get all mobile applications using Graph API
-            Write-IntuneInventoryLog -Message "Retrieving Intune applications..." -Level Info
-            $Applications = Get-GraphRequestAll -Uri "v1.0/deviceAppManagement/mobileApps"
+            if (-not $GraphApps -or $GraphApps.Count -eq 0) {
+                Write-IntuneInventoryLog -Message "No applications found in Intune" -Level Warning
+                return @{
+                    Success = $true
+                    ItemsProcessed = 0
+                    Message = "No applications found"
+                    RunId = $RunRecord.Id
+                }
+            }
             
-            Write-IntuneInventoryLog -Message "Found $($Applications.Count) applications to process" -Level Info
+            Write-IntuneInventoryLog -Message "Found $($GraphApps.Count) applications to process" -Level Info
             
-            foreach ($App in $Applications) {
+            # Clear existing data if Force is specified
+            if ($Force) {
+                Write-IntuneInventoryLog -Message "Force parameter specified - clearing existing application data" -Level Info
+                $ApplicationsPath = Join-Path $Script:StorageRoot "applications.json"
+                Save-JsonData -FilePath $ApplicationsPath -Data @()
+            }
+            
+            # Process each application
+            foreach ($GraphApp in $GraphApps) {
                 try {
-                    if ($PSCmdlet.ShouldProcess($App.DisplayName, "Inventory Intune application")) {
-                        Write-IntuneInventoryLog -Message "Processing application: $($App.DisplayName)" -Level Verbose
-                        
-                        # Determine if app has source code
-                        $HasSourceCode = 0
-                        $SourceCode = $null
-                        
-                        # For certain app types, try to get source code/install commands
-                        if ($App.'@odata.type' -eq "#microsoft.graph.win32LobApp") {
-                            try {
-                                $Win32App = Invoke-GraphRequest -Uri "v1.0/deviceAppManagement/mobileApps/$($App.id)" -Method GET
-                                if ($Win32App.installCommandLine -or $Win32App.uninstallCommandLine) {
-                                    $HasSourceCode = 1
-                                    $SourceCode = @{
-                                        InstallCommandLine = $Win32App.installCommandLine
-                                        UninstallCommandLine = $Win32App.uninstallCommandLine
-                                    } | ConvertTo-SafeJson
+                    Write-IntuneInventoryLog -Message "Processing application: $($GraphApp.displayName) (ID: $($GraphApp.id))" -Level Verbose
+                    
+                    # Create application record with safe property mapping
+                    $AppRecord = New-Object System.Collections.Hashtable
+                    
+                    # Core properties
+                    $AppRecord['Id'] = $GraphApp.id
+                    $AppRecord['DisplayName'] = $GraphApp.displayName
+                    $AppRecord['Description'] = $GraphApp.description
+                    $AppRecord['Publisher'] = $GraphApp.publisher
+                    $AppRecord['AppType'] = $GraphApp.'@odata.type'
+                    $AppRecord['CreatedDateTime'] = $GraphApp.createdDateTime
+                    $AppRecord['LastModifiedDateTime'] = $GraphApp.lastModifiedDateTime
+                    $AppRecord['IsFeatured'] = $GraphApp.isFeatured
+                    $AppRecord['PrivacyInformationUrl'] = $GraphApp.privacyInformationUrl
+                    $AppRecord['InformationUrl'] = $GraphApp.informationUrl
+                    $AppRecord['Owner'] = $GraphApp.owner
+                    $AppRecord['Developer'] = $GraphApp.developer
+                    $AppRecord['Notes'] = $GraphApp.notes
+                    $AppRecord['UploadState'] = $GraphApp.uploadState
+                    $AppRecord['PublishingState'] = $GraphApp.publishingState
+                    $AppRecord['IsAssigned'] = $GraphApp.isAssigned
+                    $AppRecord['RoleScopeTagIds'] = $GraphApp.roleScopeTagIds
+                    $AppRecord['DependentAppCount'] = $GraphApp.dependentAppCount
+                    $AppRecord['SupersedingAppCount'] = $GraphApp.supersedingAppCount
+                    $AppRecord['SupersededAppCount'] = $GraphApp.supersededAppCount
+                    $AppRecord['CommittedContentVersion'] = $GraphApp.committedContentVersion
+                    $AppRecord['FileName'] = $GraphApp.fileName
+                    $AppRecord['Size'] = $GraphApp.size
+                    $AppRecord['InstallCommandLine'] = $GraphApp.installCommandLine
+                    $AppRecord['UninstallCommandLine'] = $GraphApp.uninstallCommandLine
+                    $AppRecord['ApplicableArchitectures'] = $GraphApp.applicableArchitectures
+                    $AppRecord['MinimumFreeDiskSpaceInMB'] = $GraphApp.minimumFreeDiskSpaceInMB
+                    $AppRecord['MinimumMemoryInMB'] = $GraphApp.minimumMemoryInMB
+                    $AppRecord['MinimumNumberOfProcessors'] = $GraphApp.minimumNumberOfProcessors
+                    $AppRecord['MinimumCpuSpeedInMHz'] = $GraphApp.minimumCpuSpeedInMHz
+                    $AppRecord['Rules'] = $GraphApp.rules
+                    $AppRecord['InstallExperience'] = $GraphApp.installExperience
+                    $AppRecord['ReturnCodes'] = $GraphApp.returnCodes
+                    $AppRecord['MsiInformation'] = $GraphApp.msiInformation
+                    $AppRecord['SetupFilePath'] = $GraphApp.setupFilePath
+                    $AppRecord['MinimumSupportedWindowsRelease'] = $GraphApp.minimumSupportedWindowsRelease
+                    $AppRecord['Categories'] = $GraphApp.categories
+                    $AppRecord['AllowAvailableUninstall'] = $GraphApp.allowAvailableUninstall
+                    $AppRecord['InstalledDateTime'] = $GraphApp.installedDateTime
+                    $AppRecord['PackageId'] = $GraphApp.packageId
+                    $AppRecord['AppId'] = $GraphApp.appId
+                    $AppRecord['BundleId'] = $GraphApp.bundleId
+                    $AppRecord['MinimumSupportedOperatingSystem'] = $GraphApp.minimumSupportedOperatingSystem
+                    $AppRecord['ProductKey'] = $GraphApp.productKey
+                    $AppRecord['LicenseType'] = $GraphApp.licenseType
+                    $AppRecord['ProductIds'] = $GraphApp.productIds
+                    $AppRecord['SkuIds'] = $GraphApp.skuIds
+                    $AppRecord['ProductVersion'] = $GraphApp.productVersion
+                    $AppRecord['DisplayVersion'] = $GraphApp.displayVersion
+                    $AppRecord['IconUrl'] = if ($GraphApp.largeIcon) { $GraphApp.largeIcon.value } else { $null }
+                    
+                    # Custom inventory properties
+                    $AppRecord['HasSourceCode'] = $false
+                    $AppRecord['SourceCodePath'] = $null
+                    $AppRecord['LastInventoried'] = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                    $AppRecord['InventoryRunId'] = $RunRecord.Id
+                    
+                    # Add the application to storage
+                    Add-InventoryItem -ItemType "Applications" -Item $AppRecord
+                    
+                    # Process assignments if requested
+                    if ($IncludeAssignments) {
+                        try {
+                            Write-IntuneInventoryLog -Message "Retrieving assignments for application: $($GraphApp.displayName)" -Level Verbose
+                            $AssignmentsUri = "beta/deviceAppManagement/mobileApps/$($GraphApp.id)/assignments"
+                            $AppAssignments = Get-GraphRequestAll -Uri $AssignmentsUri
+                            
+                            if ($AppAssignments -and $AppAssignments.Count -gt 0) {
+                                # Resolve group IDs to display names
+                                $AppAssignments = Resolve-GroupAssignments -Assignments $AppAssignments
+                                
+                                foreach ($Assignment in $AppAssignments) {
+                                    $AssignmentRecord = @{
+                                        Id = $Assignment.id
+                                        ObjectId = $GraphApp.id
+                                        ObjectType = "Application"
+                                        ObjectName = $GraphApp.displayName
+                                        Intent = $Assignment.intent
+                                        Settings = $Assignment.settings
+                                        Target = ConvertTo-SafeJson -InputObject $Assignment.target
+                                        TargetType = $Assignment.target.'@odata.type'
+                                        TargetId = $Assignment.target.deviceAndAppManagementAssignmentFilterId
+                                        TargetGroupId = $Assignment.target.groupId
+                                        GroupDisplayNames = $Assignment.GroupDisplayNames
+                                        TargetDisplayName = $Assignment.TargetDisplayName
+                                        FilterType = $Assignment.target.deviceAndAppManagementAssignmentFilterType
+                                        LastModifiedDateTime = $Assignment.lastModifiedDateTime
+                                        CreatedDateTime = $Assignment.createdDateTime
+                                        LastInventoried = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                                        InventoryRunId = $RunRecord.Id
+                                    }
+                                    
+                                    Add-InventoryItem -ItemType "Assignments" -Item $AssignmentRecord
                                 }
-                            }
-                            catch {
-                                Write-IntuneInventoryLog -Message "Could not retrieve install commands for $($App.displayName): $($_.Exception.Message)" -Level Warning
-                            }
-                        }
-                        
-                        # Insert or update application record
-                        $InsertCommand = $Script:DatabaseConnection.CreateCommand()
-                        $InsertCommand.CommandText = @"
-INSERT OR REPLACE INTO Applications (
-    Id, DisplayName, Description, Publisher, AppType, CreatedDateTime, 
-    LastModifiedDateTime, PrivacyInformationUrl, InformationUrl, Owner, 
-    Developer, Notes, PublishingState, CommittedContentVersion, FileName, 
-    Size, InstallCommandLine, UninstallCommandLine, MinimumSupportedOperatingSystem,
-    HasSourceCode, SourceCode, SourceCodeAdded, InventoryDate, LastUpdated
-) VALUES (
-    @Id, @DisplayName, @Description, @Publisher, @AppType, @CreatedDateTime,
-    @LastModifiedDateTime, @PrivacyInformationUrl, @InformationUrl, @Owner,
-    @Developer, @Notes, @PublishingState, @CommittedContentVersion, @FileName,
-    @Size, @InstallCommandLine, @UninstallCommandLine, @MinimumSupportedOperatingSystem,
-    @HasSourceCode, @SourceCode, @SourceCodeAdded, @InventoryDate, @LastUpdated
-);
-"@
-                        
-                        # Add parameters
-                        $null = $InsertCommand.Parameters.AddWithValue("@Id", $App.id)
-                        $null = $InsertCommand.Parameters.AddWithValue("@DisplayName", $App.displayName ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Description", $App.description ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Publisher", $App.publisher ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@AppType", $App.'@odata.type' ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@CreatedDateTime", $App.createdDateTime ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@LastModifiedDateTime", $App.lastModifiedDateTime ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@PrivacyInformationUrl", $App.privacyInformationUrl ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@InformationUrl", $App.informationUrl ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Owner", $App.owner ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Developer", $App.developer ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Notes", $App.notes ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@PublishingState", $App.publishingState ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@CommittedContentVersion", $App.committedContentVersion ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@FileName", $App.fileName ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@Size", $App.size ?? 0)
-                        $null = $InsertCommand.Parameters.AddWithValue("@InstallCommandLine", $App.installCommandLine ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@UninstallCommandLine", $App.uninstallCommandLine ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@MinimumSupportedOperatingSystem", ($App.minimumSupportedOperatingSystem | ConvertTo-SafeJson) ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@HasSourceCode", $HasSourceCode)
-                        $null = $InsertCommand.Parameters.AddWithValue("@SourceCode", $SourceCode ?? "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@SourceCodeAdded", $HasSourceCode -eq 1 ? $StartTime.ToString("yyyy-MM-dd HH:mm:ss") : "")
-                        $null = $InsertCommand.Parameters.AddWithValue("@InventoryDate", $StartTime.ToString("yyyy-MM-dd HH:mm:ss"))
-                        $null = $InsertCommand.Parameters.AddWithValue("@LastUpdated", $StartTime.ToString("yyyy-MM-dd HH:mm:ss"))
-                        
-                        $null = $InsertCommand.ExecuteNonQuery()
-                        $InsertCommand.Dispose()
-                        
-                        # Process assignments if requested
-                        if ($IncludeAssignments) {
-                            try {
-                                $Assignments = Get-GraphRequestAll -Uri "v1.0/deviceAppManagement/mobileApps/$($App.id)/assignments"
-                                foreach ($Assignment in $Assignments) {
-                                    # Process assignment (implementation would go here)
-                                    Write-IntuneInventoryLog -Message "Processing assignment for $($App.displayName)" -Level Verbose
-                                    # Add assignment processing logic
-                                }
-                            }
-                            catch {
-                                Write-IntuneInventoryLog -Message "Could not retrieve assignments for $($App.displayName): $($_.Exception.Message)" -Level Warning
-                                $ErrorCount++
-                                $ErrorMessages += "Assignment error for $($App.displayName): $($_.Exception.Message)"
+                                
+                                Write-IntuneInventoryLog -Message "Processed $($AppAssignments.Count) assignments for application: $($GraphApp.displayName)" -Level Verbose
                             }
                         }
-                        
-                        $ItemsProcessed++
-                        
-                        if ($ItemsProcessed % 10 -eq 0) {
-                            Write-Progress -Activity "Inventorying Applications" -Status "Processed $ItemsProcessed of $($Applications.Count)" -PercentComplete (($ItemsProcessed / $Applications.Count) * 100)
+                        catch {
+                            $ErrorCount++
+                            $ErrorMessage = "Failed to retrieve assignments for application '$($GraphApp.displayName)': $($_.Exception.Message)"
+                            $ErrorMessages += $ErrorMessage
+                            Write-IntuneInventoryLog -Message $ErrorMessage -Level Warning
                         }
+                    }
+                    
+                    $ItemsProcessed++
+                    
+                    if ($ItemsProcessed % 10 -eq 0) {
+                        Write-IntuneInventoryLog -Message "Processed $ItemsProcessed applications so far..." -Level Info
                     }
                 }
                 catch {
-                    Write-IntuneInventoryLog -Message "Error processing application $($App.displayName): $($_.Exception.Message)" -Level Error
                     $ErrorCount++
-                    $ErrorMessages += "Error processing $($App.displayName): $($_.Exception.Message)"
+                    $ErrorMessage = "Failed to process application '$($GraphApp.displayName)': $($_.Exception.Message)"
+                    $ErrorMessages += $ErrorMessage
+                    Write-IntuneInventoryLog -Message $ErrorMessage -Level Error
                 }
             }
-            
-            Write-Progress -Activity "Inventorying Applications" -Completed
             
             # Update inventory run record
             $EndTime = Get-Date
-            $UpdateCommand = $Script:DatabaseConnection.CreateCommand()
-            $UpdateCommand.CommandText = @"
-UPDATE InventoryRuns 
-SET EndTime = @EndTime, Status = @Status, ItemsProcessed = @ItemsProcessed, 
-    ErrorCount = @ErrorCount, ErrorMessages = @ErrorMessages
-WHERE Id = @RunId;
-"@
-            $null = $UpdateCommand.Parameters.AddWithValue("@EndTime", $EndTime.ToString("yyyy-MM-dd HH:mm:ss"))
-            $null = $UpdateCommand.Parameters.AddWithValue("@Status", "Completed")
-            $null = $UpdateCommand.Parameters.AddWithValue("@ItemsProcessed", $ItemsProcessed)
-            $null = $UpdateCommand.Parameters.AddWithValue("@ErrorCount", $ErrorCount)
-            $null = $UpdateCommand.Parameters.AddWithValue("@ErrorMessages", ($ErrorMessages -join "; "))
-            $null = $UpdateCommand.Parameters.AddWithValue("@RunId", $RunId)
+            $Duration = ($EndTime - $StartTime).TotalMinutes
             
-            $null = $UpdateCommand.ExecuteNonQuery()
-            $UpdateCommand.Dispose()
+            $RunRecord.Status = if ($ErrorCount -eq 0) { "Completed" } else { "CompletedWithErrors" }
+            $RunRecord.ItemsProcessed = $ItemsProcessed
+            $RunRecord.ErrorCount = $ErrorCount
+            $RunRecord.ErrorMessages = $ErrorMessages
+            $RunRecord.EndTime = $EndTime.ToString("yyyy-MM-dd HH:mm:ss")
+            $RunRecord.Duration = [math]::Round($Duration, 2)
             
-            Write-IntuneInventoryLog -Message "Application inventory completed. Processed: $ItemsProcessed, Errors: $ErrorCount" -Level Info
-            Write-Host "Application inventory completed!" -ForegroundColor Green
-            Write-Host "Applications processed: $ItemsProcessed" -ForegroundColor Cyan
+            Add-InventoryItem -ItemType "InventoryRuns" -Item $RunRecord
+            
+            $SuccessMessage = "Application inventory completed successfully. Processed $ItemsProcessed applications"
             if ($ErrorCount -gt 0) {
-                Write-Host "Errors encountered: $ErrorCount" -ForegroundColor Yellow
+                $SuccessMessage += " with $ErrorCount errors"
+            }
+            
+            Write-IntuneInventoryLog -Message $SuccessMessage -Level Info
+            
+            return @{
+                Success = $true
+                ItemsProcessed = $ItemsProcessed
+                ErrorCount = $ErrorCount
+                ErrorMessages = $ErrorMessages
+                Duration = $Duration
+                RunId = $RunRecord.Id
+                Message = $SuccessMessage
             }
         }
         catch {
-            # Update inventory run with error status
-            if ($RunId) {
+            $ErrorMessage = "Critical error during application inventory: $($_.Exception.Message)"
+            Write-IntuneInventoryLog -Message $ErrorMessage -Level Error
+            
+            # Update run record with error status
+            if ($RunRecord) {
+                $RunRecord.Status = "Failed"
+                $RunRecord.ErrorCount = $ErrorCount + 1
+                $RunRecord.ErrorMessages = $ErrorMessages + $ErrorMessage
+                $RunRecord.EndTime = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                $RunRecord.Duration = [math]::Round(((Get-Date) - $StartTime).TotalMinutes, 2)
+                
                 try {
-                    $ErrorCommand = $Script:DatabaseConnection.CreateCommand()
-                    $ErrorCommand.CommandText = @"
-UPDATE InventoryRuns 
-SET EndTime = @EndTime, Status = @Status, ItemsProcessed = @ItemsProcessed, 
-    ErrorCount = @ErrorCount, ErrorMessages = @ErrorMessages
-WHERE Id = @RunId;
-"@
-                    $null = $ErrorCommand.Parameters.AddWithValue("@EndTime", (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"))
-                    $null = $ErrorCommand.Parameters.AddWithValue("@Status", "Failed")
-                    $null = $ErrorCommand.Parameters.AddWithValue("@ItemsProcessed", $ItemsProcessed)
-                    $null = $ErrorCommand.Parameters.AddWithValue("@ErrorCount", $ErrorCount + 1)
-                    $null = $ErrorCommand.Parameters.AddWithValue("@ErrorMessages", ($ErrorMessages + $_.Exception.Message) -join "; ")
-                    $null = $ErrorCommand.Parameters.AddWithValue("@RunId", $RunId)
-                    
-                    $null = $ErrorCommand.ExecuteNonQuery()
-                    $ErrorCommand.Dispose()
+                    Add-InventoryItem -ItemType "InventoryRuns" -Item $RunRecord
                 }
                 catch {
-                    Write-IntuneInventoryLog -Message "Failed to update inventory run with error status: $($_.Exception.Message)" -Level Warning
+                    Write-IntuneInventoryLog -Message "Failed to update run record: $($_.Exception.Message)" -Level Error
                 }
             }
             
-            Write-IntuneInventoryLog -Message "Application inventory failed: $($_.Exception.Message)" -Level Error
-            throw
+            throw $ErrorMessage
         }
     }
     
     end {
-        Write-IntuneInventoryLog -Message "Application inventory process completed" -Level Info -Source "Invoke-IntuneApplicationInventory"
+        Write-IntuneInventoryLog -Message "Application inventory operation completed" -Level Info -Source "Invoke-IntuneApplicationInventory"
     }
 }

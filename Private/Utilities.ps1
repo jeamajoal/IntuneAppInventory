@@ -319,9 +319,20 @@ function Invoke-GraphRequest {
             throw "No valid Graph token available. Please authenticate first."
         }
         
+        # Construct full URI if needed
+        if ([System.Uri]::IsWellFormedUriString($Uri, [System.UriKind]::Absolute)) {
+            # URI is already a complete URL
+            $requestUri = $Uri
+        } elseif ([System.Uri]::IsWellFormedUriString("https://graph.microsoft.com/$Uri", [System.UriKind]::Absolute)) {
+            # URI is a relative path, prepend base URL
+            $requestUri = "https://graph.microsoft.com/$Uri"
+        } else {
+            throw "Invalid or malformed URI: $Uri"
+        }
+
         # Prepare request parameters
         $RequestParams = @{
-            Uri = $Uri
+            Uri = $requestUri
             Method = $Method
             Headers = $Script:GraphHeaders
             ErrorAction = 'Stop'
@@ -573,5 +584,107 @@ function Get-CurrentUserContext {
             ClientId = $Script:ProductionClientId
             AuthMethod = "Unknown"
         }
+    }
+}
+
+function Resolve-GroupAssignments {
+    <#
+    .SYNOPSIS
+    Resolves group IDs in assignment targets to include display names.
+    
+    .DESCRIPTION
+    Takes assignment data and resolves any group IDs to their display names,
+    adding GroupDisplayNames array to the assignment record.
+    
+    .PARAMETER Assignments
+    Array of assignment objects to process.
+    
+    .EXAMPLE
+    $EnhancedAssignments = Resolve-GroupAssignments -Assignments $AppAssignments
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [array]$Assignments
+    )
+    
+    begin {
+        Write-Verbose "Starting group ID resolution for $($Assignments.Count) assignments"
+        
+        # Cache for group lookups to avoid duplicate API calls
+        $Script:GroupCache = @{}
+    }
+    
+    process {
+        try {
+            foreach ($Assignment in $Assignments) {
+                # Initialize group display names array
+                $GroupDisplayNames = @()
+                
+                # Check if assignment has a group ID
+                if ($Assignment.target -and $Assignment.target.groupId) {
+                    $GroupId = $Assignment.target.groupId
+                    
+                    # Check cache first
+                    if ($Script:GroupCache.ContainsKey($GroupId)) {
+                        $GroupDisplayNames += $Script:GroupCache[$GroupId]
+                        Write-Verbose "Using cached group name for ${GroupId}: $($Script:GroupCache[$GroupId])"
+                    }
+                    else {
+                        # Look up group from Graph API
+                        try {
+                            Write-Verbose "Looking up group ID: $GroupId"
+                            $GroupInfo = Invoke-GraphRequest -Uri "v1.0/groups/$GroupId" -Method GET
+                            
+                            if ($GroupInfo -and $GroupInfo.displayName) {
+                                $DisplayName = $GroupInfo.displayName
+                                $GroupDisplayNames += $DisplayName
+                                $Script:GroupCache[$GroupId] = $DisplayName
+                                Write-Verbose "Resolved group $GroupId to: $DisplayName"
+                            }
+                            else {
+                                Write-Warning "Could not resolve group ID: $GroupId"
+                                $GroupDisplayNames += "Unknown Group ($GroupId)"
+                                $Script:GroupCache[$GroupId] = "Unknown Group ($GroupId)"
+                            }
+                        }
+                        catch {
+                            Write-Warning "Failed to resolve group ID $GroupId : $($_.Exception.Message)"
+                            $GroupDisplayNames += "Error Resolving ($GroupId)"
+                            $Script:GroupCache[$GroupId] = "Error Resolving ($GroupId)"
+                        }
+                    }
+                }
+                
+                # Handle special target types
+                $TargetDisplayName = switch ($Assignment.target.'@odata.type') {
+                    '#microsoft.graph.allLicensedUsersAssignmentTarget' { 'All Users' }
+                    '#microsoft.graph.allDevicesAssignmentTarget' { 'All Devices' }
+                    '#microsoft.graph.exclusionGroupAssignmentTarget' { "Exclude: $($GroupDisplayNames -join ', ')" }
+                    '#microsoft.graph.groupAssignmentTarget' { $GroupDisplayNames -join ', ' }
+                    default { 
+                        if ($GroupDisplayNames.Count -gt 0) { 
+                            $GroupDisplayNames -join ', ' 
+                        } else { 
+                            'Unknown Target' 
+                        }
+                    }
+                }
+                
+                # Add resolved information to assignment
+                $Assignment | Add-Member -MemberType NoteProperty -Name 'GroupDisplayNames' -Value $GroupDisplayNames -Force
+                $Assignment | Add-Member -MemberType NoteProperty -Name 'TargetDisplayName' -Value $TargetDisplayName -Force
+            }
+            
+            return $Assignments
+        }
+        catch {
+            Write-Error "Failed to resolve group assignments: $($_.Exception.Message)"
+            return $Assignments
+        }
+    }
+    
+    end {
+        Write-Verbose "Completed group ID resolution. Cache contains $($Script:GroupCache.Count) entries"
     }
 }

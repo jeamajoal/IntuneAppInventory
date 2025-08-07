@@ -61,9 +61,12 @@
 
     # Functions to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no functions to export.
     FunctionsToExport = @(
-        'Initialize-IntuneInventoryDatabase',
+        'Initialize-IntuneInventoryStorage',
         'Connect-IntuneInventory',
         'Disconnect-IntuneInventory',
+        'Test-IntuneConnection',
+        'Get-IntuneConnectionInfo',
+        'Invoke-CompleteIntuneInventory',
         'Invoke-IntuneApplicationInventory',
         'Invoke-IntuneScriptInventory',
         'Invoke-IntuneRemediationInventory',
@@ -71,12 +74,14 @@
         'Export-IntuneInventoryReport',
         'Add-IntuneInventorySourceCode',
         'Get-IntuneInventorySourceCode',
+        'Get-IntuneLobAppContent',
         'Update-IntuneInventoryItem',
         'Remove-IntuneInventoryItem',
         'Get-IntuneInventoryItem',
         'Get-IntuneInventoryAssignments',
-        'Backup-IntuneInventoryDatabase',
-        'Restore-IntuneInventoryDatabase'
+        'Backup-JsonStorage',
+        'Clear-StorageCache',
+        'Get-StorageStatistics'
     )
 
     # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
