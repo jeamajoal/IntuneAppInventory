@@ -78,15 +78,14 @@ Initialize-IntuneInventoryDatabase -DatabasePath "C:\IntuneInventory\inventory.d
 
 ### 2. Connect to Intune
 ```powershell
-# Interactive authentication
+# Production authentication (uses standard credentials)
 Connect-IntuneInventory
 
-# With specific tenant
-Connect-IntuneInventory -TenantId "contoso.onmicrosoft.com"
+# Use write-enabled credentials for operations requiring write access
+Connect-IntuneInventory -UseWriteCredentials
 
-# Service principal authentication
-$ClientSecret = ConvertTo-SecureString "your-secret" -AsPlainText -Force
-Connect-IntuneInventory -TenantId "tenant-id" -ClientId "client-id" -ClientSecret $ClientSecret
+# Specify custom database location
+Connect-IntuneInventory -DatabasePath "C:\IntuneInventory\inventory.db"
 ```
 
 ### 3. Run Inventory
@@ -123,7 +122,7 @@ Get-IntuneInventoryReport -ReportType All -FilterMissingSourceCode
 
 ### Connection Management
 - `Initialize-IntuneInventoryDatabase` - Set up the SQLite database
-- `Connect-IntuneInventory` - Authenticate to Microsoft Graph
+- `Connect-IntuneInventory` - Authenticate to Microsoft Graph using production credentials
 - `Disconnect-IntuneInventory` - Clean up connections
 
 ### Inventory Operations
@@ -201,10 +200,11 @@ $env:APPDATA\IntuneInventory\inventory.db
 The module includes placeholder logging functions that can be customized based on your organization's logging standards. Update the `Write-IntuneInventoryLog` function in `Private\Utilities.ps1` to integrate with your logging system.
 
 ### Authentication Configuration
-The module supports multiple authentication methods:
-- Interactive authentication (default)
-- Service principal with client secret
-- Certificate-based authentication
+The module uses production-standard authentication with:
+- **Tenant ID**: Automatically configured for production environment
+- **Client ID**: Uses production app registrations (read and write)
+- **Credentials**: Stored securely in `C:\Scheduled_Task_Resources\KeysCreds\`
+- **Logging**: Integrates with global automation logging system
 
 ## Troubleshooting
 

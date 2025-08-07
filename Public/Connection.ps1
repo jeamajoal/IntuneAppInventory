@@ -119,77 +119,46 @@ VALUES (@RunType, @StartTime, @Status, @TenantId, @UserPrincipalName);
 function Connect-IntuneInventory {
     <#
     .SYNOPSIS
-    Establishes connection to Microsoft Graph for Intune inventory operations.
+    Establishes connection to Microsoft Graph for Intune inventory operations using production credentials.
     
     .DESCRIPTION
-    Authenticates to Microsoft Graph using pure REST API calls with the required permissions 
-    for inventorying Intune applications, scripts, and remediations. Also establishes database connection.
+    Authenticates to Microsoft Graph using the production-standard authentication pattern with
+    the required permissions for inventorying Intune applications, scripts, and remediations.
+    Also establishes database connection.
     
-    .PARAMETER TenantId
-    The Azure AD tenant ID to connect to.
-    
-    .PARAMETER ClientId
-    The application (client) ID for authentication.
-    
-    .PARAMETER ClientSecret
-    The client secret for application authentication.
-    
-    .PARAMETER CertificateThumbprint
-    The certificate thumbprint for certificate-based authentication.
+    .PARAMETER UseWriteCredentials
+    Use write-enabled credentials instead of read-only credentials for operations that require write access.
     
     .PARAMETER DatabasePath
     The path to the SQLite database. If not specified, uses the module default.
     
     .EXAMPLE
-    Connect-IntuneInventory -TenantId "contoso.onmicrosoft.com" -ClientId "12345678-1234-1234-1234-123456789012" -ClientSecret $SecureSecret
+    Connect-IntuneInventory
     
     .EXAMPLE
-    Connect-IntuneInventory -TenantId "12345678-1234-1234-1234-123456789012" -ClientId "87654321-4321-4321-4321-210987654321" -CertificateThumbprint "ABCD1234..."
+    Connect-IntuneInventory -UseWriteCredentials
+    
+    .EXAMPLE
+    Connect-IntuneInventory -DatabasePath "C:\IntuneInventory\inventory.db"
     #>
-    [CmdletBinding(DefaultParameterSetName = 'ClientSecret')]
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$TenantId,
-        
-        [Parameter(Mandatory = $true)]
-        [string]$ClientId,
-        
-        [Parameter(ParameterSetName = 'ClientSecret', Mandatory = $true)]
-        [SecureString]$ClientSecret,
-        
-        [Parameter(ParameterSetName = 'Certificate', Mandatory = $true)]
-        [string]$CertificateThumbprint,
+        [Parameter()]
+        [switch]$UseWriteCredentials,
         
         [Parameter()]
         [string]$DatabasePath
     )
     
     begin {
-        Write-IntuneInventoryLog -Message "Starting Intune inventory connection" -Level Info -Source "Connect-IntuneInventory"
+        Write-IntuneInventoryLog -Message "Starting Intune inventory connection using production credentials" -Level Info -Source "Connect-IntuneInventory"
     }
     
     process {
         try {
-            # Get access token using pure Graph API
-            $TokenParams = @{
-                TenantId = $TenantId
-                ClientId = $ClientId
-            }
-            
-            switch ($PSCmdlet.ParameterSetName) {
-                'ClientSecret' {
-                    $TokenParams.ClientSecret = $ClientSecret
-                    Write-IntuneInventoryLog -Message "Using client secret authentication" -Level Info
-                }
-                'Certificate' {
-                    $TokenParams.CertificateThumbprint = $CertificateThumbprint
-                    Write-IntuneInventoryLog -Message "Using certificate authentication" -Level Info
-                }
-            }
-            
-            # Acquire token
+            # Acquire token using production standard
             Write-IntuneInventoryLog -Message "Acquiring Microsoft Graph access token..." -Level Info
-            $TokenResult = Get-GraphAccessToken @TokenParams
+            $TokenResult = Get-GraphAccessToken -UseWriteCredentials:$UseWriteCredentials
             
             if (-not $TokenResult.TokenAcquired) {
                 throw "Failed to acquire Microsoft Graph access token"
@@ -201,19 +170,20 @@ function Connect-IntuneInventory {
             }
             
             # Get organization info for connection details
-            $OrgInfo = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/organization" -Method GET
-            $OrgDetails = $OrgInfo.value[0]
+            $OrgInfo = Get-GraphRequestAll -Uri "v1.0/organization"
+            $OrgDetails = $OrgInfo[0]
             
-            Write-IntuneInventoryLog -Message "Connected to tenant: $($OrgDetails.displayName) ($TenantId)" -Level Info
+            Write-IntuneInventoryLog -Message "Connected to tenant: $($OrgDetails.displayName) ($($Script:ProductionTenantId))" -Level Info
             
             # Store connection information
             $Script:ConnectionInfo = @{
-                TenantId = $TenantId
-                ClientId = $ClientId
+                TenantId = $Script:ProductionTenantId
+                ClientId = if ($UseWriteCredentials) { $Script:ProductionClientIdWrite } else { $Script:ProductionClientId }
                 UserPrincipalName = $OrgDetails.displayName
                 ConnectedAt = Get-Date
-                AuthMethod = $PSCmdlet.ParameterSetName
+                AuthMethod = "ClientCredentials"
                 TokenExpiry = $Script:TokenExpiry
+                UseWriteCredentials = $UseWriteCredentials.IsPresent
             }
             
             # Establish database connection
@@ -240,9 +210,15 @@ function Connect-IntuneInventory {
             
             Write-Host "Successfully connected to Intune inventory system!" -ForegroundColor Green
             Write-Host "Tenant: $($OrgDetails.displayName)" -ForegroundColor Cyan
-            Write-Host "Organization: $TenantId" -ForegroundColor Cyan
+            Write-Host "Organization: $($Script:ProductionTenantId)" -ForegroundColor Cyan
+            Write-Host "Client ID: $($Script:ConnectionInfo.ClientId)" -ForegroundColor Cyan
             Write-Host "Database: $Script:DatabasePath" -ForegroundColor Cyan
             Write-Host "Token expires: $($Script:TokenExpiry.ToString('yyyy-MM-dd HH:mm:ss'))" -ForegroundColor Yellow
+            if ($UseWriteCredentials) {
+                Write-Host "Using WRITE credentials - Full Intune management access" -ForegroundColor Yellow
+            } else {
+                Write-Host "Using READ credentials - Read-only access" -ForegroundColor Green
+            }
         }
         catch {
             Write-IntuneInventoryLog -Message "Connection failed: $($_.Exception.Message)" -Level Error
@@ -262,7 +238,7 @@ function Disconnect-IntuneInventory {
     
     .DESCRIPTION
     Properly clears the Graph token cache and closes the SQLite database connection
-    to clean up resources.
+    to clean up resources using production-standard cleanup procedures.
     
     .EXAMPLE
     Disconnect-IntuneInventory
@@ -283,11 +259,10 @@ function Disconnect-IntuneInventory {
                 Write-IntuneInventoryLog -Message "Database connection closed" -Level Info
             }
             
-            # Clear Graph token and cache
+            # Clear Graph token and cache (production pattern)
             $Script:GraphToken = $null
             $Script:TokenExpiry = $null
             $Script:GraphHeaders = @{}
-            $Script:TokenCache = @{}
             $Script:ConnectionInfo = $null
             
             Write-IntuneInventoryLog -Message "Graph authentication cleared" -Level Info

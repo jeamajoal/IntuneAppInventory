@@ -27,7 +27,7 @@ foreach ($Directory in $FunctionDirectories) {
     }
 }
 
-# Module cleanup
+# Module cleanup - Production pattern
 $MyInvocation.MyCommand.ScriptBlock.Module.OnRemove = {
     if ($Script:DatabaseConnection) {
         try {
@@ -39,12 +39,16 @@ $MyInvocation.MyCommand.ScriptBlock.Module.OnRemove = {
         }
     }
     
-    if ($Script:IntuneConnection) {
+    # Clean up Graph authentication resources
+    if ($Script:GraphToken) {
         try {
-            Disconnect-MgGraph -ErrorAction SilentlyContinue
+            $Script:GraphToken = $null
+            $Script:TokenExpiry = $null
+            $Script:GraphHeaders = @{}
+            $Script:ConnectionInfo = $null
         }
         catch {
-            Write-Warning "Error disconnecting from Microsoft Graph: $($_.Exception.Message)"
+            Write-Warning "Error clearing Graph authentication: $($_.Exception.Message)"
         }
     }
 }

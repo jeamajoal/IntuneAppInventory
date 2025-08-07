@@ -1,107 +1,83 @@
-# Module-scoped variables for Graph API
+# Module-scoped variables for Graph API - Production Pattern
 $Script:GraphToken = $null
 $Script:TokenExpiry = $null
 $Script:GraphHeaders = @{}
 $Script:GraphBaseUrl = "https://graph.microsoft.com/v1.0"
-$Script:TokenCache = @{}
 $Script:ConnectionInfo = $null
+
+# Production credential configuration
+$Script:CredRoot = 'C:\Scheduled_Task_Resources\KeysCreds'
+$Script:ProductionTenantId = '06b476ce-d8bc-4355-a477-0392dd2dc025'
+$Script:ProductionClientId = 'ab9240e1-f604-40e0-a193-c3ac9d817077'
+$Script:ProductionClientIdWrite = '23582b3b-26a4-4ec6-84ec-6877195c22bf'
 
 function Get-GraphAccessToken {
     <#
     .SYNOPSIS
-    Acquires an access token for Microsoft Graph API.
+    Acquires an access token for Microsoft Graph API using production credentials.
     
     .DESCRIPTION
-    Gets an access token using client credentials flow for Microsoft Graph API access.
-    Supports both client secret and certificate-based authentication.
+    Gets an access token using the production Graph API app registration and credentials.
+    Uses the standardized authentication pattern from production automation scripts.
     
-    .PARAMETER TenantId
-    The Azure AD tenant ID.
-    
-    .PARAMETER ClientId
-    The application (client) ID.
-    
-    .PARAMETER ClientSecret
-    The client secret for authentication.
-    
-    .PARAMETER CertificateThumbprint
-    The certificate thumbprint for certificate-based authentication.
+    .PARAMETER UseWriteCredentials
+    Use the write-enabled app registration instead of read-only credentials.
     
     .PARAMETER ForceRefresh
     Force acquisition of a new token even if cached token is valid.
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$TenantId,
-        
-        [Parameter(Mandatory = $true)]
-        [string]$ClientId,
-        
-        [Parameter(ParameterSetName = 'ClientSecret', Mandatory = $true)]
-        [SecureString]$ClientSecret,
-        
-        [Parameter(ParameterSetName = 'Certificate')]
-        [string]$CertificateThumbprint,
+        [Parameter()]
+        [switch]$UseWriteCredentials,
         
         [Parameter()]
         [switch]$ForceRefresh
     )
     
     begin {
-        Write-Verbose "Get-GraphAccessToken: Starting token acquisition"
+        Write-Verbose "Get-GraphAccessToken: Starting production token acquisition"
         
-        # Check cache unless force refresh
-        if (-not $ForceRefresh) {
-            $CacheKey = "$TenantId-$ClientId"
-            if ($Script:TokenCache.ContainsKey($CacheKey)) {
-                $Cached = $Script:TokenCache[$CacheKey]
-                if ($Cached.Expiry -gt (Get-Date).AddMinutes(5)) {
-                    Write-Verbose "Using cached token (expires: $($Cached.Expiry))"
-                    $Script:GraphToken = $Cached.Token
-                    $Script:TokenExpiry = $Cached.Expiry
-                    $Script:GraphHeaders = @{
-                        'Authorization' = "Bearer $($Cached.Token)"
-                        'Content-Type' = 'application/json'
-                        'Accept' = 'application/json'
-                    }
-                    return @{
-                        TokenAcquired = $true
-                        Source = "Cache"
-                        ExpiresAt = $Cached.Expiry
-                    }
+        # Check if we have a valid token unless force refresh
+        if (-not $ForceRefresh -and $Script:GraphToken -and $Script:TokenExpiry) {
+            if ($Script:TokenExpiry -gt (Get-Date).AddMinutes(5)) {
+                Write-Verbose "Using cached token (expires: $($Script:TokenExpiry))"
+                return @{
+                    TokenAcquired = $true
+                    Source = "Cache"
+                    ExpiresAt = $Script:TokenExpiry
                 }
             }
         }
-        
-        $TokenEndpoint = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
     }
     
     process {
         try {
-            # Build request body
-            $Body = @{
-                client_id = $ClientId
-                scope = "https://graph.microsoft.com/.default"
-                grant_type = "client_credentials"
+            # Use production credentials
+            $TenantId = $Script:ProductionTenantId
+            $ClientId = if ($UseWriteCredentials) { $Script:ProductionClientIdWrite } else { $Script:ProductionClientId }
+            
+            # Load client secret from production location
+            $SecretFile = if ($UseWriteCredentials) { 'graph-write.txt' } else { 'graph.txt' }
+            $SecretPath = Join-Path $Script:CredRoot $SecretFile
+            
+            if (-not (Test-Path $SecretPath)) {
+                throw "Cannot find credential file: $SecretPath"
             }
             
-            # Handle authentication method
-            if ($PSCmdlet.ParameterSetName -eq 'ClientSecret') {
-                # Convert SecureString to plain text
-                $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($ClientSecret)
-                try {
-                    $PlainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
-                    $Body.client_secret = $PlainSecret
-                }
-                finally {
-                    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
-                    if ($PlainSecret) { Clear-Variable PlainSecret -Force }
-                }
+            $ClientSecret = Get-Content $SecretPath
+            
+            Write-Verbose "Using production credentials: TenantId=$TenantId, ClientId=$ClientId"
+            
+            # Build OAuth2 request - production standard
+            $Body = @{
+                Grant_Type    = "client_credentials"
+                Scope         = "https://graph.microsoft.com/.default"
+                Client_Id     = $ClientId
+                Client_Secret = $ClientSecret
             }
-            elseif ($PSCmdlet.ParameterSetName -eq 'Certificate') {
-                throw "Certificate authentication not yet implemented"
-            }
+            
+            $TokenEndpoint = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
             
             # Make token request
             Write-Verbose "Requesting token from $TokenEndpoint"
@@ -117,15 +93,6 @@ function Get-GraphAccessToken {
                 'Authorization' = "Bearer $($Response.access_token)"
                 'Content-Type' = 'application/json'
                 'Accept' = 'application/json'
-            }
-            
-            # Cache token
-            $CacheKey = "$TenantId-$ClientId"
-            $Script:TokenCache[$CacheKey] = @{
-                Token = $Response.access_token
-                Expiry = $ExpiryTime
-                TenantId = $TenantId
-                ClientId = $ClientId
             }
             
             Write-Verbose "Token acquired successfully (expires: $ExpiryTime)"
@@ -153,8 +120,8 @@ function Get-GraphAccessToken {
         }
         finally {
             # Clear sensitive variables
-            if ($Body -and $Body.client_secret) {
-                $Body.client_secret = $null
+            if ($ClientSecret) {
+                Clear-Variable ClientSecret -Force -ErrorAction SilentlyContinue
             }
         }
     }
@@ -193,26 +160,138 @@ function Test-GraphToken {
     }
 }
 
+function Get-GraphRequestAll {
+    <#
+    .SYNOPSIS
+    Makes paginated GET requests to Microsoft Graph API using production standard.
+    
+    .DESCRIPTION
+    Production-standard function for making GET requests to Microsoft Graph API with
+    automatic pagination, retry logic, and error handling. Based on Get-SoundMgGraphRequestAll-v2.
+    
+    .PARAMETER Uri
+    The Graph API endpoint URI (relative or absolute).
+    
+    .PARAMETER Headers
+    Additional headers to include in the request.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Uri,
+        
+        [Parameter()]
+        [hashtable]$Headers = @{}
+    )
+    
+    try {
+        # Ensure we have a valid token
+        if (-not (Test-GraphToken)) {
+            throw "No valid Graph token available. Please authenticate first."
+        }
+        
+        # Make the initial request - ensure URI is well-formed
+        if ([System.Uri]::IsWellFormedUriString($Uri, [System.UriKind]::Absolute)) {
+            # URI is already a complete URL
+            $requestUri = $Uri
+        } elseif ([System.Uri]::IsWellFormedUriString("https://graph.microsoft.com/$Uri", [System.UriKind]::Absolute)) {
+            # URI is a relative path, prepend base URL
+            $requestUri = "https://graph.microsoft.com/$Uri"
+        } else {
+            throw "Invalid or malformed URI: $Uri"
+        }
+        
+        # Prepare headers - merge default auth headers with custom headers
+        $requestHeaders = @{
+            'Authorization' = "Bearer $Script:GraphToken"
+            'Content-Type' = 'application/json'
+        }
+        
+        # Add any additional headers (like ConsistencyLevel for advanced queries)
+        foreach ($key in $Headers.Keys) {
+            $requestHeaders[$key] = $Headers[$key]
+        }
+        
+        # Initialize variables for pagination
+        $nextLink = $requestUri
+        $allResults = @()
+        $retryCount = 0
+        $maxRetries = 3
+        $retryDelaySeconds = 5
+        $pageCount = 0
+        
+        while ($nextLink) {
+            try {
+                Write-Verbose "Making Graph API request to: $nextLink (Page: $($pageCount + 1))"
+                
+                # Make the Graph API request with headers
+                $response = Invoke-RestMethod -Uri $nextLink -Headers $requestHeaders -Method Get
+                
+                # Add results to collection
+                if ($response.value) {
+                    $allResults += $response.value
+                    Write-Verbose "Retrieved $($response.value.Count) items from page $($pageCount + 1)"
+                }
+                
+                # Move to next page - handle multiple possible property names
+                $nextLink = $null
+                if ($response.PSObject.Properties['@odata.nextLink']) {
+                    $nextLink = $response.'@odata.nextLink'
+                } elseif ($response.PSObject.Properties['odata.nextLink']) {
+                    $nextLink = $response.'odata.nextLink'
+                } elseif ($response.PSObject.Properties['nextLink']) {
+                    $nextLink = $response.nextLink
+                }
+                
+                $pageCount++
+                $retryCount = 0  # Reset retry count on successful request
+                
+                if (-not $nextLink) {
+                    Write-Verbose "No more pages to retrieve."
+                    break
+                }
+            } catch {
+                $retryCount++
+                Write-Warning "Graph API request failed (Attempt $retryCount/$maxRetries) for URL: $nextLink - $($_.Exception.Message)"
+                
+                if ($retryCount -ge $maxRetries) {
+                    throw "Failed to fetch data from $nextLink after $maxRetries retries. Last error: $($_.Exception.Message)"
+                }
+                
+                Write-Verbose "Retrying request to: $nextLink in $retryDelaySeconds seconds"
+                Start-Sleep -Seconds $retryDelaySeconds
+                # Note: $nextLink stays the same for retry
+            }
+        }
+        
+        Write-Verbose "Completed Graph API pagination. Total pages: $pageCount, Total items: $($allResults.Count)"
+        return $allResults
+    } catch {
+        Write-Error "Error making Graph API request: $($_.Exception.Message)"
+        throw
+    }
+}
+
 function Invoke-GraphRequest {
     <#
     .SYNOPSIS
-    Makes a request to Microsoft Graph API.
+    Makes HTTP requests to Microsoft Graph API with robust error handling.
     
     .DESCRIPTION
-    Wrapper function for making HTTP requests to Microsoft Graph API with proper error handling
-    and automatic pagination support.
+    Production-standard function for making various HTTP requests to Microsoft Graph API
+    with comprehensive retry logic and error handling. Based on Invoke-RobustGraphRequest.
     
     .PARAMETER Uri
     The Graph API endpoint URI.
     
     .PARAMETER Method
-    The HTTP method (GET, POST, PUT, DELETE, PATCH).
+    HTTP method (GET, POST, PUT, DELETE, PATCH).
     
     .PARAMETER Body
     The request body for POST/PUT/PATCH requests.
     
     .PARAMETER All
-    Automatically handle pagination and return all results.
+    Automatically handle pagination and return all results (GET requests only).
     #>
     [CmdletBinding()]
     param(
@@ -230,6 +309,11 @@ function Invoke-GraphRequest {
     )
     
     try {
+        # For GET requests with All switch, use pagination function
+        if ($Method -eq 'GET' -and $All) {
+            return Get-GraphRequestAll -Uri $Uri
+        }
+        
         # Ensure we have a valid token
         if (-not (Test-GraphToken)) {
             throw "No valid Graph token available. Please authenticate first."
@@ -252,67 +336,53 @@ function Invoke-GraphRequest {
             }
         }
         
-        # Make initial request
-        $Response = Invoke-RestMethod @RequestParams
+        # Make request with retry logic
+        $maxRetries = 3
+        $retryDelay = 5
         
-        # Handle pagination if All switch is specified
-        if ($All -and $Response.'@odata.nextLink') {
-            $AllResults = @()
-            if ($Response.value) {
-                $AllResults += $Response.value
+        for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+            try {
+                $Response = Invoke-RestMethod @RequestParams
+                Write-Verbose "Graph API request completed successfully"
+                return $Response
             }
-            else {
-                $AllResults += $Response
-            }
-            
-            $NextLink = $Response.'@odata.nextLink'
-            while ($NextLink) {
-                Write-Verbose "Following pagination link: $NextLink"
-                $RequestParams.Uri = $NextLink
-                $PageResponse = Invoke-RestMethod @RequestParams
-                
-                if ($PageResponse.value) {
-                    $AllResults += $PageResponse.value
+            catch {
+                $statusCode = $null
+                if ($_.Exception.Response) {
+                    $statusCode = [int]$_.Exception.Response.StatusCode
                 }
                 
-                $NextLink = $PageResponse.'@odata.nextLink'
+                Write-Verbose "Graph API request attempt $attempt failed. Status: $statusCode"
+                
+                # Check for non-retryable errors
+                if ($statusCode -ge 400 -and $statusCode -le 499) {
+                    # Client errors - don't retry
+                    throw "Graph API request failed with status $statusCode : $($_.Exception.Message)"
+                }
+                
+                if ($attempt -ge $maxRetries) {
+                    throw "Graph API request failed after $maxRetries retries: $($_.Exception.Message)"
+                }
+                
+                Write-Verbose "Retrying Graph API request in $retryDelay seconds..."
+                Start-Sleep -Seconds $retryDelay
             }
-            
-            return $AllResults
         }
-        
-        return $Response
     }
     catch {
         $ErrorMessage = "Graph API request failed: $($_.Exception.Message)"
-        
-        # Try to extract more detailed error information
-        if ($_.Exception.Response) {
-            try {
-                $ErrorStream = $_.Exception.Response.GetResponseStream()
-                $Reader = New-Object System.IO.StreamReader($ErrorStream)
-                $ErrorBody = $Reader.ReadToEnd() | ConvertFrom-Json
-                
-                if ($ErrorBody.error) {
-                    $ErrorMessage += " - $($ErrorBody.error.code): $($ErrorBody.error.message)"
-                }
-            }
-            catch {
-                # If we can't parse the error response, use the original message
-            }
-        }
-        
         Write-Error $ErrorMessage
         throw
     }
 }
+function Write-IntuneInventoryLog {
     <#
     .SYNOPSIS
-    Writes log messages for the Intune Inventory module.
+    Writes log messages for the Intune Inventory module using production logging standard.
     
     .DESCRIPTION
-    Centralized logging function that writes messages to various outputs based on configuration.
-    This is a placeholder that will be customized based on user-provided logging examples.
+    Centralized logging function that writes messages to various outputs.
+    Note: This does NOT use Write-GlobalLog - that should only be used for automation initiation and failures.
     
     .PARAMETER Message
     The log message to write.
@@ -339,6 +409,7 @@ function Invoke-GraphRequest {
     $Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $LogMessage = "[$Timestamp] [$Level] [$Source] $Message"
     
+    # Standard output based on level
     switch ($Level) {
         'Error' { Write-Error $LogMessage }
         'Warning' { Write-Warning $LogMessage }
@@ -348,48 +419,23 @@ function Invoke-GraphRequest {
     }
 }
 
-function Test-GraphAuthentication {
+function Write-ProductionLog {
     <#
     .SYNOPSIS
-    Tests if Microsoft Graph authentication is valid and has required permissions.
+    Writes to the production global logging system following production patterns.
     
     .DESCRIPTION
-    Verifies that the current Microsoft Graph session has the necessary permissions
-    for Intune inventory operations.
-    #>
-    [CmdletBinding()]
-    param()
-    
-    try {
-        $Context = Get-MgContext
-        if (-not $Context) {
-            Write-IntuneInventoryLog -Message "No Microsoft Graph authentication context found" -Level Error
-            return $false
-        }
-        
-        # Test basic connectivity
-        try {
-            $null = Get-MgOrganization -ErrorAction Stop
-            Write-IntuneInventoryLog -Message "Microsoft Graph connectivity verified" -Level Verbose
-        }
-        catch {
-    function Write-IntuneInventoryLog {
-    <#
-    .SYNOPSIS
-    Writes log messages for the Intune Inventory module.
-    
-    .DESCRIPTION
-    Centralized logging function that writes messages to various outputs based on configuration.
-    This is a placeholder that will be customized based on user-provided logging examples.
+    Used ONLY for automation initiation and critical failures, following the production
+    standard of using Write-GlobalLog sparingly (once for initiation, once for failures).
     
     .PARAMETER Message
-    The log message to write.
+    The message to write to global log.
     
-    .PARAMETER Level
-    The log level (Info, Warning, Error, Debug, Verbose).
+    .PARAMETER IsInitiation
+    Indicates this is an automation initiation log.
     
-    .PARAMETER Source
-    The source component or function generating the log.
+    .PARAMETER IsFailure
+    Indicates this is a critical failure log.
     #>
     [CmdletBinding()]
     param(
@@ -397,82 +443,26 @@ function Test-GraphAuthentication {
         [string]$Message,
         
         [Parameter()]
-        [ValidateSet('Info', 'Warning', 'Error', 'Debug', 'Verbose')]
-        [string]$Level = 'Info',
+        [switch]$IsInitiation,
         
         [Parameter()]
-        [string]$Source = 'IntuneInventory'
+        [switch]$IsFailure
     )
     
-    $Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $LogMessage = "[$Timestamp] [$Level] [$Source] $Message"
-    
-    switch ($Level) {
-        'Error' { Write-Error $LogMessage }
-        'Warning' { Write-Warning $LogMessage }
-        'Debug' { Write-Debug $LogMessage }
-        'Verbose' { Write-Verbose $LogMessage }
-        default { Write-Host $LogMessage }
-    }
-}
-
-function Test-GraphAuthentication {
-    <#
-    .SYNOPSIS
-    Tests if Microsoft Graph authentication is valid and has required permissions.
-    
-    .DESCRIPTION
-    Verifies that the current Microsoft Graph session has the necessary permissions
-    for Intune inventory operations using pure Graph API calls.
-    #>
-    [CmdletBinding()]
-    param()
-    
-    try {
-        if (-not (Test-GraphToken)) {
-            Write-IntuneInventoryLog -Message "No valid Microsoft Graph token found" -Level Error
-            return $false
-        }
-        
-        # Test basic connectivity with organization endpoint
+    # Only log to global system for initiation or failures
+    if ($IsInitiation -or $IsFailure) {
         try {
-            $OrgResponse = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/organization" -Method GET
-            Write-IntuneInventoryLog -Message "Microsoft Graph connectivity verified" -Level Verbose
+            if (Get-Command Write-GlobalLog -ErrorAction SilentlyContinue) {
+                Write-GlobalLog -Message $Message -scriptName "IntuneInventory"
+                Write-IntuneInventoryLog -Message "Global log written: $Message" -Level Verbose
+            }
+            else {
+                Write-IntuneInventoryLog -Message "Write-GlobalLog not available. Message would have been: $Message" -Level Verbose
+            }
         }
         catch {
-            Write-IntuneInventoryLog -Message "Microsoft Graph connectivity test failed: $($_.Exception.Message)" -Level Error
-            return $false
+            Write-IntuneInventoryLog -Message "Failed to write global log: $($_.Exception.Message)" -Level Warning
         }
-        
-        # Test Intune-specific endpoints to verify permissions
-        $TestEndpoints = @(
-            @{ Endpoint = "deviceAppManagement/mobileApps?`$top=1"; Description = "Mobile Apps" },
-            @{ Endpoint = "deviceManagement/deviceManagementScripts?`$top=1"; Description = "Device Management Scripts" },
-            @{ Endpoint = "deviceManagement/deviceHealthScripts?`$top=1"; Description = "Device Health Scripts" }
-        )
-        
-        $PermissionErrors = @()
-        foreach ($Test in $TestEndpoints) {
-            try {
-                $null = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/$($Test.Endpoint)" -Method GET
-                Write-IntuneInventoryLog -Message "Permission verified for $($Test.Description)" -Level Verbose
-            }
-            catch {
-                $PermissionErrors += "$($Test.Description): $($_.Exception.Message)"
-            }
-        }
-        
-        if ($PermissionErrors.Count -gt 0) {
-            Write-IntuneInventoryLog -Message "Permission verification failed for: $($PermissionErrors -join '; ')" -Level Warning
-            return $false
-        }
-        
-        Write-IntuneInventoryLog -Message "Microsoft Graph authentication and permissions verified" -Level Info
-        return $true
-    }
-    catch {
-        Write-IntuneInventoryLog -Message "Authentication test failed: $($_.Exception.Message)" -Level Error
-        return $false
     }
 }
 
@@ -551,6 +541,7 @@ function Get-CurrentUserContext {
     
     .DESCRIPTION
     Returns information about the current user session for logging and audit trails.
+    Uses production-standard authentication context.
     #>
     [CmdletBinding()]
     param()
@@ -565,11 +556,12 @@ function Get-CurrentUserContext {
             }
         }
         else {
+            # Return production standard context
             return @{
-                UserPrincipalName = $env:USERNAME
-                TenantId = $null
-                ClientId = $null
-                AuthMethod = "Unknown"
+                UserPrincipalName = "Production Service Account"
+                TenantId = $Script:ProductionTenantId
+                ClientId = $Script:ProductionClientId
+                AuthMethod = "ClientCredentials"
             }
         }
     }
@@ -577,8 +569,8 @@ function Get-CurrentUserContext {
         Write-IntuneInventoryLog -Message "Failed to get user context: $($_.Exception.Message)" -Level Warning
         return @{
             UserPrincipalName = $env:USERNAME
-            TenantId = $null
-            ClientId = $null
+            TenantId = $Script:ProductionTenantId
+            ClientId = $Script:ProductionClientId
             AuthMethod = "Unknown"
         }
     }

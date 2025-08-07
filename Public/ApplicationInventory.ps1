@@ -70,7 +70,7 @@ SELECT last_insert_rowid();
             
             # Get all mobile applications using Graph API
             Write-IntuneInventoryLog -Message "Retrieving Intune applications..." -Level Info
-            $Applications = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/deviceAppManagement/mobileApps" -Method GET -All
+            $Applications = Get-GraphRequestAll -Uri "v1.0/deviceAppManagement/mobileApps"
             
             Write-IntuneInventoryLog -Message "Found $($Applications.Count) applications to process" -Level Info
             
@@ -86,7 +86,7 @@ SELECT last_insert_rowid();
                         # For certain app types, try to get source code/install commands
                         if ($App.'@odata.type' -eq "#microsoft.graph.win32LobApp") {
                             try {
-                                $Win32App = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/deviceAppManagement/mobileApps/$($App.id)" -Method GET
+                                $Win32App = Invoke-GraphRequest -Uri "v1.0/deviceAppManagement/mobileApps/$($App.id)" -Method GET
                                 if ($Win32App.installCommandLine -or $Win32App.uninstallCommandLine) {
                                     $HasSourceCode = 1
                                     $SourceCode = @{
@@ -150,7 +150,7 @@ INSERT OR REPLACE INTO Applications (
                         # Process assignments if requested
                         if ($IncludeAssignments) {
                             try {
-                                $Assignments = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/deviceAppManagement/mobileApps/$($App.id)/assignments" -Method GET -All
+                                $Assignments = Get-GraphRequestAll -Uri "v1.0/deviceAppManagement/mobileApps/$($App.id)/assignments"
                                 foreach ($Assignment in $Assignments) {
                                     # Process assignment (implementation would go here)
                                     Write-IntuneInventoryLog -Message "Processing assignment for $($App.displayName)" -Level Verbose

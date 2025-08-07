@@ -70,7 +70,7 @@ SELECT last_insert_rowid();
             
             # Get all device PowerShell scripts using Graph API
             Write-IntuneInventoryLog -Message "Retrieving Intune PowerShell scripts..." -Level Info
-            $Scripts = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/deviceManagement/deviceManagementScripts" -Method GET -All
+            $Scripts = Get-GraphRequestAll -Uri "v1.0/deviceManagement/deviceManagementScripts"
             
             Write-IntuneInventoryLog -Message "Found $($Scripts.Count) scripts to process" -Level Info
             
@@ -83,7 +83,7 @@ SELECT last_insert_rowid();
                         $ScriptContent = ""
                         $SourceCode = ""
                         try {
-                            $ScriptDetail = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/deviceManagement/deviceManagementScripts/$($Script.id)" -Method GET
+                            $ScriptDetail = Invoke-GraphRequest -Uri "v1.0/deviceManagement/deviceManagementScripts/$($Script.id)" -Method GET
                             if ($ScriptDetail.scriptContent) {
                                 # Script content is base64 encoded
                                 $ScriptBytes = [System.Convert]::FromBase64String($ScriptDetail.scriptContent)
@@ -133,7 +133,7 @@ INSERT OR REPLACE INTO Scripts (
                         # Process assignments if requested
                         if ($IncludeAssignments) {
                             try {
-                                $Assignments = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/deviceManagement/deviceManagementScripts/$($Script.id)/assignments" -Method GET -All
+                                $Assignments = Get-GraphRequestAll -Uri "v1.0/deviceManagement/deviceManagementScripts/$($Script.id)/assignments"
                                 foreach ($Assignment in $Assignments) {
                                     # Process assignment (similar to application assignments)
                                     Write-IntuneInventoryLog -Message "Processing assignment for script: $($Script.displayName)" -Level Verbose
@@ -297,7 +297,7 @@ SELECT last_insert_rowid();
             
             # Get all device health scripts (remediations) using Graph API
             Write-IntuneInventoryLog -Message "Retrieving Intune remediation scripts..." -Level Info
-            $Remediations = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/deviceManagement/deviceHealthScripts" -Method GET -All
+            $Remediations = Get-GraphRequestAll -Uri "v1.0/deviceManagement/deviceHealthScripts"
             
             Write-IntuneInventoryLog -Message "Found $($Remediations.Count) remediations to process" -Level Info
             
@@ -378,7 +378,7 @@ INSERT OR REPLACE INTO Remediations (
                         # Process assignments if requested
                         if ($IncludeAssignments) {
                             try {
-                                $Assignments = Invoke-GraphRequest -Uri "$Script:GraphBaseUrl/deviceManagement/deviceHealthScripts/$($Remediation.id)/assignments" -Method GET -All
+                                $Assignments = Get-GraphRequestAll -Uri "v1.0/deviceManagement/deviceHealthScripts/$($Remediation.id)/assignments"
                                 foreach ($Assignment in $Assignments) {
                                     # Process assignment (similar to other assignments)
                                     Write-IntuneInventoryLog -Message "Processing assignment for remediation: $($Remediation.displayName)" -Level Verbose
