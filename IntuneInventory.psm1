@@ -72,5 +72,9 @@ Export-ModuleMember -Function @(
     'Get-IntuneInventoryAssignments',
     'Backup-JsonStorage',
     'Clear-StorageCache',
-    'Get-StorageStatistics'
+    'Get-StorageStatistics',
+    'Get-IntuneWin32AppRecoveryHelp',
+    'Test-IntuneAppExtractionEnvironment',
+    'Get-IntuneLoggedApps',
+    'Invoke-IntuneStagingCapture'
 )

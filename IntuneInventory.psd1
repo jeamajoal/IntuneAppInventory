@@ -6,7 +6,7 @@
     ModuleVersion = '1.0.0'
 
     # Supported PSEditions
-    CompatiblePSEditions = @('Desktop', 'Core')
+    CompatiblePSEditions = @('Desktop')
 
     # ID used to uniquely identify this module
     GUID = '12345678-1234-1234-1234-123456789012'
@@ -75,6 +75,10 @@
         'Add-IntuneInventorySourceCode',
         'Get-IntuneInventorySourceCode',
         'Get-IntuneLobAppContent',
+        'Get-IntuneWin32AppRecoveryHelp',
+        'Test-IntuneAppExtractionEnvironment',
+        'Get-IntuneLoggedApps',
+        'Invoke-IntuneStagingCapture',
         'Update-IntuneInventoryItem',
         'Remove-IntuneInventoryItem',
         'Get-IntuneInventoryItem',

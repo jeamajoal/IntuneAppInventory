@@ -235,6 +235,41 @@ $VerbosePreference = 'Continue'
 Connect-IntuneInventory -Verbose
 ```
 
+## Important Limitations
+
+### Win32 Application Content Recovery
+
+**The Microsoft Graph API does not provide direct access to download .intunewin file content.** This is due to Microsoft's security model where:
+- Content is encrypted and requires device-specific certificates for decryption
+- Only enrolled devices with proper certificates can access the actual application files
+- The Graph API intentionally restricts this access for security reasons
+
+#### Alternative Approach for Content Recovery
+
+If you need to recover source files from Win32 applications, use this device-based approach:
+
+1. **Use an enrolled device** that has the target applications installed
+2. **Parse Intune Management Extension logs** for download URLs and decryption information:
+   ```
+   C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\IntuneManagementExtension.log
+   ```
+3. **Use specialized tools** to decrypt the content:
+   - [IntuneWinAppUtilDecoder](https://github.com/okieselbach/Intune/tree/master/IntuneWinAppUtilDecoder)
+   - [Get-DecryptInfoFromSideCarLogFiles.ps1](https://github.com/okieselbach/Intune/blob/master/Get-DecryptInfoFromSideCarLogFiles.ps1)
+
+#### Module Support for Recovery Guidance
+
+The module includes guidance functions:
+```powershell
+# Get detailed recovery guidance
+Get-IntuneAppRecoveryGuidance -ShowTools -ShowUrls
+
+# Attempt to retrieve content metadata (limited)
+Get-IntuneLobAppContent -AppId "your-app-id"
+```
+
+**Reference**: [How to decode Intune Win32 App Packages](https://msendpointmgr.com/2019/01/18/how-to-decode-intune-win32-app-packages/) by Oliver Kieselbach
+
 ## Contributing
 
 This module is designed to be extended and customized for specific organizational needs. Key areas for customization:

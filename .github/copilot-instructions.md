@@ -6,6 +6,8 @@ This is a PowerShell module project for inventorying Microsoft Intune applicatio
 
 ## Project Guidelines
 
+- **PowerShell 5.1 Compatibility**: This module MUST be compatible with PowerShell 5.1 - do not use any PowerShell 7+ features
+- **Character Encoding**: Use standard characters only - NO special ASCII/Unicode characters (no emojis, special symbols, etc.)
 - Follow PowerShell best practices and coding standards
 - Use approved verbs for PowerShell functions (Get-, Set-, New-, Remove-, etc.)
 - Implement proper error handling with try/catch blocks
